@@ -5,6 +5,9 @@
 # Системные блокировки и кэш
 .bot.lock
 bot.lock
+*.db
+*.sqlite*
+messages.db
 __pycache__/
 *.py[cod]
 *$py.class

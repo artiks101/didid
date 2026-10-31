@@ -1,8 +1,13 @@
+import json
+import sqlite3
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Optional, Union, Any
 import discord
 from bot.config import Config
+
+DB_FILE = Path(__file__).resolve().parent.parent / "messages.db"
 
 
 class LogColors:
@@ -75,40 +80,92 @@ PERMISSION_NAMES_RU: dict[str, str] = {
 }
 
 
-class MessageCache:
-    """Кэш сообщений для сохранения текста удаленных сообщений."""
+class PersistentMessageCache:
+    """Энергонезависимый кэш сообщений на базе SQLite, сохраняющийся между перезапусками бота."""
 
-    def __init__(self, max_size: int = 5000):
-        self.max_size = max_size
-        self._cache: OrderedDict[int, dict] = OrderedDict()
-        self._recent_deletions: list[dict] = []
+    def __init__(self, db_path: Path = DB_FILE, max_age_days: int = 14):
+        self.db_path = str(db_path)
+        self.max_age_days = max_age_days
+        self._init_db()
+
+    def _init_db(self):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS messages (
+                        id INTEGER PRIMARY KEY,
+                        channel_id INTEGER,
+                        author_id INTEGER,
+                        author_name TEXT,
+                        content TEXT,
+                        attachments TEXT,
+                        created_at REAL
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_chan_auth ON messages(channel_id, author_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_time ON messages(created_at)")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS recent_deletions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        message_id INTEGER,
+                        channel_id INTEGER,
+                        author_id INTEGER,
+                        content TEXT,
+                        attachments TEXT,
+                        deleted_at REAL
+                    )
+                """)
+                # Автоочистка старых данных (старше 14 дней)
+                cutoff = time.time() - (self.max_age_days * 86400)
+                conn.execute("DELETE FROM messages WHERE created_at < ?", (cutoff,))
+                conn.execute("DELETE FROM recent_deletions WHERE deleted_at < ?", (time.time() - 300,))
+                conn.commit()
+        except Exception:
+            pass
 
     def add(self, message: discord.Message):
         if not message.guild:
             return
-        self._cache[message.id] = {
-            "id": message.id,
-            "channel_id": message.channel.id,
-            "author_id": message.author.id,
-            "author_name": str(message.author),
-            "content": message.content or "",
-            "attachments": [a.url for a in message.attachments],
-            "created_at": message.created_at,
-        }
-        if len(self._cache) > self.max_size:
-            self._cache.popitem(last=False)
+        attachments_json = json.dumps([a.url for a in message.attachments])
+        created_ts = message.created_at.timestamp() if message.created_at else time.time()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (message.id, message.channel.id, message.author.id, str(message.author), message.content or "", attachments_json, created_ts)
+                )
+        except Exception:
+            pass
 
     def on_delete(self, message: discord.Message) -> dict:
-        cached = self._cache.pop(message.id, None)
-        content = message.content if message.content else (cached["content"] if cached else "")
-        attachments = (
-            [a.url for a in message.attachments]
-            if message.attachments
-            else (cached["attachments"] if cached else [])
-        )
-        author_id = message.author.id if message.author else (cached["author_id"] if cached else 0)
+        content = message.content or ""
+        attachments = [a.url for a in message.attachments] if message.attachments else []
+        author_id = message.author.id if message.author else 0
 
-        entry = {
+        # Если сообщение не было в памяти Discord, восстанавливаем из SQLite
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT content, attachments, author_id FROM messages WHERE id = ?", (message.id,))
+                row = cursor.fetchone()
+                if row:
+                    if not content and row[0]:
+                        content = row[0]
+                    if not attachments and row[1]:
+                        attachments = json.loads(row[1])
+                    if not author_id and row[2]:
+                        author_id = row[2]
+
+                now = time.time()
+                conn.execute(
+                    "INSERT INTO recent_deletions (message_id, channel_id, author_id, content, attachments, deleted_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (message.id, message.channel.id, author_id, content, json.dumps(attachments), now)
+                )
+                conn.commit()
+        except Exception:
+            pass
+
+        return {
             "message_id": message.id,
             "channel_id": message.channel.id,
             "author_id": author_id,
@@ -116,34 +173,55 @@ class MessageCache:
             "attachments": attachments,
             "deleted_at": time.time(),
         }
-        self._recent_deletions.append(entry)
-
-        # Очищаем записи старше 60 секунд
-        now = time.time()
-        self._recent_deletions = [d for d in self._recent_deletions if now - d["deleted_at"] < 60]
-        return entry
 
     def pop_recent_deletion(self, channel_id: int, author_id: int) -> Optional[dict]:
         now = time.time()
-        candidates = [
-            d
-            for d in self._recent_deletions
-            if d["channel_id"] == channel_id
-            and (author_id == 0 or d["author_id"] == author_id)
-            and now - d["deleted_at"] < 35
-        ]
-        if candidates:
-            res = candidates[-1]
-            try:
-                self._recent_deletions.remove(res)
-            except ValueError:
-                pass
-            return res
-        return None
+        res = None
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """SELECT id, message_id, content, attachments FROM recent_deletions
+                       WHERE channel_id = ? AND (author_id = ? OR author_id = 0) AND (? - deleted_at < 60)
+                       ORDER BY deleted_at DESC LIMIT 1""",
+                    (channel_id, author_id, now)
+                )
+                row = cursor.fetchone()
+                if row:
+                    del_id, msg_id, content, att_json = row
+                    attachments = json.loads(att_json) if att_json else []
+                    res = {"message_id": msg_id, "content": content, "attachments": attachments}
+                    conn.execute("DELETE FROM recent_deletions WHERE id = ?", (del_id,))
+                    conn.commit()
+                else:
+                    cursor.execute(
+                        """SELECT id, content, attachments FROM messages
+                           WHERE channel_id = ? AND author_id = ?
+                           ORDER BY created_at DESC LIMIT 1""",
+                        (channel_id, author_id)
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        msg_id, content, att_json = row
+                        attachments = json.loads(att_json) if att_json else []
+                        res = {"message_id": msg_id, "content": content, "attachments": attachments}
+        except Exception:
+            pass
+        return res
+
+    def get_count(self) -> int:
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM messages")
+                row = cursor.fetchone()
+                return row[0] if row else 0
+        except Exception:
+            return 0
 
 
-# Глобальный экземпляр кэша сообщений
-message_cache = MessageCache()
+# Глобальный экземпляр энергонезависимого кэша
+message_cache = PersistentMessageCache()
 
 
 class ShowMessageContentView(discord.ui.View):

@@ -19,6 +19,7 @@ if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
 from bot.config import Config
+from bot.utils import message_cache
 
 # Настройка логирования в консоль
 logging.basicConfig(
@@ -103,8 +104,28 @@ async def on_ready():
     except Exception:
         pass
 
+    # Фоновая предзагрузка сообщений из каналов в кэш
+    asyncio.create_task(preload_history(bot))
+
     logger.info("🛡️ Модули логирования активированы и готовы к работе.")
     logger.info("=" * 60)
+
+
+async def preload_history(bot: commands.Bot):
+    """Фоновая подгрузка недавних сообщений из каналов при старте бота."""
+    loaded = 0
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            perms = channel.permissions_for(guild.me)
+            if perms.read_messages and perms.read_message_history:
+                try:
+                    async for msg in channel.history(limit=30):
+                        if not msg.author.bot:
+                            message_cache.add(msg)
+                            loaded += 1
+                except Exception:
+                    pass
+    logger.info(f"💾 Предзагружено недавних сообщений из каналов: {loaded} (Всего в базе данных: {message_cache.get_count()})")
 
 
 async def main():

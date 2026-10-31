@@ -87,7 +87,7 @@ class StatusCog(commands.Cog):
         )
         embed.add_field(
             name="🌐 Серверов / Кэш",
-            value=f"Серверов: `{len(self.bot.guilds)}`\nСообщений в кэше: `{len(message_cache._cache)}`",
+            value=f"Серверов: `{len(self.bot.guilds)}`\nСообщений в кэше: `{message_cache.get_count()}`",
             inline=True,
         )
 
