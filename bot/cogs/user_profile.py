@@ -122,6 +122,29 @@ class UserActivityTracker:
                 self.add_voice_seconds(user_id, guild_id, elapsed)
                 self._active_voice[user_id] = (guild_id, now)
 
+    def delete_user_data(self, user_id: int, guild_id: Optional[int] = None):
+        """Полностью удаляет данные активности и кэшированных сообщений участника."""
+        self._active_voice.pop(user_id, None)
+        self._session_start.pop(user_id, None)
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                if guild_id:
+                    conn.execute("DELETE FROM user_activity WHERE user_id=? AND guild_id=?", (user_id, guild_id))
+                else:
+                    conn.execute("DELETE FROM user_activity WHERE user_id=?", (user_id,))
+                conn.commit()
+        except Exception:
+            pass
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("DELETE FROM messages WHERE author_id=?", (user_id,))
+                conn.execute("DELETE FROM recent_deletions WHERE author_id=?", (user_id,))
+                conn.commit()
+        except Exception:
+            pass
+
     def get_stats(self, user_id: int, guild_id: int) -> tuple[int, float, Optional[float]]:
         msg_count = 0
         voice_secs = 0.0
@@ -245,6 +268,21 @@ class UserProfileCog(commands.Cog):
         # Переход между каналами
         elif before.channel and after.channel and before.channel.id != after.channel.id:
             tracker.voice_switch(member.id, member.guild.id)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        """Срабатывает при выходе участника с сервера, а также при его исключении (кике) или блокировке (бане)."""
+        if member.bot:
+            return
+        guild_id = member.guild.id if member.guild else None
+        tracker.delete_user_data(member.id, guild_id)
+
+    @commands.Cog.listener()
+    async def on_member_ban(self, guild: discord.Guild, user: Union[discord.User, discord.Member]):
+        """Срабатывает при блокировке (бане) пользователя."""
+        if getattr(user, "bot", False):
+            return
+        tracker.delete_user_data(user.id, guild.id if guild else None)
 
     def _build_me_embed(self, member: discord.Member, is_self: bool = True) -> discord.Embed:
         guild = getattr(member, "guild", None)
