@@ -18,6 +18,8 @@ except ImportError:
 
 START_TIME = time.time()
 
+ALLOWED_STATUS_USERS = {390855855110619136, 821428386727460915}
+
 
 class StatusCog(commands.Cog):
     """Команда проверки статуса и работоспособности бота."""
@@ -105,13 +107,20 @@ class StatusCog(commands.Cog):
 
     @app_commands.command(name="status", description="Показывает текущий статус и статистику работы бота")
     async def status_slash(self, interaction: discord.Interaction):
-        """Слэш-команда /status (видна только вызвавшему)"""
+        """Слэш-команда /status (видна только разрешенным пользователям)"""
+        if interaction.user.id not in ALLOWED_STATUS_USERS:
+            await interaction.response.send_message("❌ У вас нет доступа к этой команде.", ephemeral=True)
+            return
+
         embed = self._build_status_embed()
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @commands.command(name="status")
     async def status_prefix(self, ctx: commands.Context):
         """Текстовая команда !status"""
+        if ctx.author.id not in ALLOWED_STATUS_USERS:
+            return
+
         embed = self._build_status_embed()
         try:
             await ctx.message.delete()
@@ -128,6 +137,9 @@ class StatusCog(commands.Cog):
         if message.author.bot or not message.guild:
             return
         if message.content.strip().lower() in ("/status", "!status", ".status"):
+            if message.author.id not in ALLOWED_STATUS_USERS:
+                return
+
             embed = self._build_status_embed()
             try:
                 await message.delete()
