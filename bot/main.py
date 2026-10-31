@@ -142,6 +142,7 @@ async def main():
         "bot.cogs.audit_logs",
         "bot.cogs.direct_events",
         "bot.cogs.status",
+        "bot.cogs.user_profile",
     ]
 
     for ext in initial_extensions:
