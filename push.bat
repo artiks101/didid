@@ -1,19 +1,19 @@
 @echo off
 chcp 65001 > nul
-title Push to GitHub
+title Push to GitHub (artiks101/didid)
 echo ===================================================
-echo Отправка обновлений бота в GitHub (artiks101/didid)
+echo Отправка обновлений бота в GitHub: artiks101/didid
 echo ===================================================
 
-set /p msg="Комментарий к обновлению (Enter для 'update'): "
+set /p msg="Комментарий к коммиту (или нажмите Enter): "
 if "%msg%"=="" set msg=Update bot: %date% %time%
 
-git add bot/ requirements.txt README.md .env.example .gitignore run.bat push.bat
+git add .
 git commit -m "%msg%"
-git push origin main
+git push -u origin main
 
 echo.
 echo ===================================================
-echo Готово!
+echo Завершено!
 echo ===================================================
 pause
