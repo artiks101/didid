@@ -8,7 +8,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot.utils import LogColors
+from bot.utils import LogColors, is_admin
 
 DB_FILE = Path(__file__).resolve().parent.parent.parent / "messages.db"
 
@@ -78,6 +78,30 @@ class UserActivityTracker:
                     VALUES (?, ?, 0, ?)
                     ON CONFLICT(user_id, guild_id) DO UPDATE SET voice_seconds = voice_seconds + ?
                 """, (user_id, guild_id, seconds, seconds))
+                conn.commit()
+        except Exception:
+            pass
+
+    def set_voice_seconds(self, user_id: int, guild_id: int, seconds: float):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    INSERT INTO user_activity (user_id, guild_id, message_count, voice_seconds)
+                    VALUES (?, ?, 0, ?)
+                    ON CONFLICT(user_id, guild_id) DO UPDATE SET voice_seconds = ?
+                """, (user_id, guild_id, seconds, seconds))
+                conn.commit()
+        except Exception:
+            pass
+
+    def set_message_count(self, user_id: int, guild_id: int, count: int):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    INSERT INTO user_activity (user_id, guild_id, message_count, voice_seconds)
+                    VALUES (?, ?, ?, 0)
+                    ON CONFLICT(user_id, guild_id) DO UPDATE SET message_count = ?
+                """, (user_id, guild_id, count, count))
                 conn.commit()
         except Exception:
             pass
@@ -282,6 +306,65 @@ class UserProfileCog(commands.Cog):
             await ctx.author.send(embed=embed)
         except Exception:
             await ctx.send(embed=embed, delete_after=25)
+
+    @app_commands.command(
+        name="setvoice",
+        description="[Администратор] Установить время в голосовых каналах для участника"
+    )
+    @app_commands.describe(
+        member="Участник",
+        hours="Количество часов",
+        minutes="Количество минут (опционально)"
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def set_voice_slash(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        hours: int,
+        minutes: int = 0
+    ):
+        """Установить время в войсе (только для администраторов)"""
+        if not await is_admin(interaction.guild, interaction.user):
+            await interaction.response.send_message("❌ У вас нет прав администратора для этой команды.", ephemeral=True)
+            return
+
+        total_secs = max(0, (hours * 3600) + (minutes * 60))
+        tracker.set_voice_seconds(member.id, interaction.guild.id, total_secs)
+        if member.id in tracker._active_voice:
+            tracker._active_voice[member.id] = time.time()
+
+        dur_str = format_voice_duration(total_secs)
+        await interaction.response.send_message(
+            f"✅ Для {member.mention} установлено время в голосовых: **{dur_str}**",
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="setmessages",
+        description="[Администратор] Установить количество сообщений для участника"
+    )
+    @app_commands.describe(
+        member="Участник",
+        count="Количество сообщений"
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def set_messages_slash(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        count: int
+    ):
+        """Установить количество сообщений (только для администраторов)"""
+        if not await is_admin(interaction.guild, interaction.user):
+            await interaction.response.send_message("❌ У вас нет прав администратора для этой команды.", ephemeral=True)
+            return
+
+        tracker.set_message_count(member.id, interaction.guild.id, max(0, count))
+        await interaction.response.send_message(
+            f"✅ Для {member.mention} установлено количество сообщений: **{count}**",
+            ephemeral=True
+        )
 
 
 async def setup(bot: commands.Bot):
