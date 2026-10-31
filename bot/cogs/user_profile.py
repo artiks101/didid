@@ -2,7 +2,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import discord
 from discord import app_commands
@@ -156,13 +156,30 @@ class UserProfileCog(commands.Cog):
             return
         tracker.increment_messages(message.author.id, message.guild.id)
 
-        # Резервный текстовый триггер /me или !me
-        if message.content.strip().lower() in ("/me", "!me", ".me"):
+        # Резервный текстовый триггер /me или !me (с поддержкой ника/упоминания)
+        content = message.content.strip()
+        lower = content.lower()
+        if lower.startswith(("/me", "!me", ".me")):
+            parts = content.split(maxsplit=1)
+            target = message.author
+            if len(parts) > 1 and message.guild:
+                query = parts[1].strip()
+                if message.mentions:
+                    target = message.mentions[0]
+                else:
+                    found = discord.utils.find(
+                        lambda m: query.lower() in m.name.lower() or query.lower() in (m.nick or "").lower() or str(m.id) == query,
+                        message.guild.members
+                    )
+                    if found:
+                        target = found
+
             try:
                 await message.delete()
             except Exception:
                 pass
-            embed = self._build_me_embed(message.author)
+
+            embed = self._build_me_embed(target, is_self=(target.id == message.author.id))
             try:
                 await message.author.send(embed=embed)
             except Exception:
@@ -183,12 +200,13 @@ class UserProfileCog(commands.Cog):
         elif before.channel and after.channel and before.channel.id != after.channel.id:
             tracker.voice_switch(member.id, member.guild.id)
 
-    def _build_me_embed(self, member: discord.Member) -> discord.Embed:
-        guild = member.guild
-        msg_count, voice_secs, current_session = tracker.get_stats(member.id, guild.id)
+    def _build_me_embed(self, member: discord.Member, is_self: bool = True) -> discord.Embed:
+        guild = getattr(member, "guild", None)
+        guild_id = guild.id if guild else 0
+        msg_count, voice_secs, current_session = tracker.get_stats(member.id, guild_id)
 
         # Время на сервере
-        if member.joined_at:
+        if hasattr(member, "joined_at") and member.joined_at:
             now = datetime.now(timezone.utc)
             delta_days = (now - member.joined_at).days
             join_ts = int(member.joined_at.timestamp())
@@ -199,49 +217,63 @@ class UserProfileCog(commands.Cog):
         # Голосовое время
         voice_str = format_voice_duration(voice_secs)
         voice_extra = ""
-        if current_session is not None and member.voice and member.voice.channel:
-            ch_name = getattr(member.voice.channel, "name", "голосовой канал")
+        if current_session is not None and hasattr(member, "voice") and member.voice and member.voice.channel:
             voice_extra = f"\n🟢 *Сейчас в <#{member.voice.channel.id}> ({format_voice_duration(current_session)})*"
 
         # Роли участника (без @everyone)
-        roles = [r.mention for r in reversed(member.roles[1:])]
+        roles = [r.mention for r in reversed(member.roles[1:])] if hasattr(member, "roles") else []
         roles_str = ", ".join(roles[:8]) if roles else "Нет специальных ролей"
-        if len(member.roles) > 9:
+        if hasattr(member, "roles") and len(member.roles) > 9:
             roles_str += f" *(и ещё {len(member.roles) - 9})*"
 
+        title = f"👤 Ваш профиль: {member.display_name}" if is_self else f"👤 Профиль участника: {member.display_name}"
+        roles_label = "🛡️ Ваши роли" if is_self else "🛡️ Роли участника"
+        color = member.color if hasattr(member, "color") and member.color.value != 0 else LogColors.BLUE
+
         embed = discord.Embed(
-            title=f"👤 Ваш профиль: {member.display_name}",
-            color=member.color if member.color.value != 0 else LogColors.BLUE,
+            title=title,
+            color=color,
             timestamp=discord.utils.utcnow()
         )
-        embed.set_thumbnail(url=member.display_avatar.url)
+        avatar_url = member.display_avatar.url if hasattr(member, "display_avatar") else None
+        if avatar_url:
+            embed.set_thumbnail(url=avatar_url)
 
         embed.add_field(name="📅 На сервере", value=days_str, inline=False)
         embed.add_field(name="💬 Написано сообщений", value=f"**{msg_count}** сообщений", inline=True)
         embed.add_field(name="🎙️ Время в голосовых", value=f"**{voice_str}**{voice_extra}", inline=True)
-        embed.add_field(name="🛡️ Ваши роли", value=roles_str, inline=False)
+        embed.add_field(name=roles_label, value=roles_str, inline=False)
 
-        created_ts = int(member.created_at.timestamp())
+        created_str = member.created_at.strftime('%d.%m.%Y') if hasattr(member, "created_at") and member.created_at else "Н/Д"
         embed.set_footer(
-            text=f"Аккаунт создан: {member.created_at.strftime('%d.%m.%Y')} • ID: {member.id}"
+            text=f"Аккаунт создан: {created_str} • ID: {member.id}"
         )
         return embed
 
-    @app_commands.command(name="me", description="Ваша персональная статистика: дни на сервере, сообщения, время в войсе")
-    async def me_slash(self, interaction: discord.Interaction):
-        """Слэш-команда /me (приватная, видна только автору)"""
-        if not isinstance(interaction.user, discord.Member):
-            member = interaction.guild.get_member(interaction.user.id) or interaction.user
-        else:
-            member = interaction.user
+    @app_commands.command(
+        name="me",
+        description="Статистика участника: дни на сервере, сообщения, время в войсе"
+    )
+    @app_commands.describe(
+        member="Участник сервера, чью статистику показать (оставьте пустым для себя)"
+    )
+    async def me_slash(self, interaction: discord.Interaction, member: Optional[discord.Member] = None):
+        """Слэш-команда /me [участник] (приватная, видна только автору вызова)"""
+        caller = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
+        target = member or caller
+        if not target:
+            target = interaction.user
 
-        embed = self._build_me_embed(member)
+        is_self = (caller is not None and target.id == caller.id)
+        embed = self._build_me_embed(target, is_self=is_self)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @commands.command(name="me")
-    async def me_prefix(self, ctx: commands.Context):
-        """Текстовая команда !me"""
-        embed = self._build_me_embed(ctx.author)
+    async def me_prefix(self, ctx: commands.Context, *, member: Optional[discord.Member] = None):
+        """Текстовая команда !me [@участник]"""
+        target = member or ctx.author
+        is_self = (target.id == ctx.author.id)
+        embed = self._build_me_embed(target, is_self=is_self)
         try:
             await ctx.message.delete()
         except Exception:
