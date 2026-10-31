@@ -1,0 +1,22 @@
+# Токены и секретные переменные окружения
+.env
+*.env
+
+# Системные блокировки и кэш
+.bot.lock
+bot.lock
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Временные архивы и IDE
+*.zip
+venv/
+.venv/
+.idea/
+.vscode/
+
+# Служебные файлы роя
+.claude-flow/
+.swarm/
