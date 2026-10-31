@@ -89,12 +89,19 @@ async def on_ready():
     )
     await bot.change_presence(status=discord.Status.online, activity=activity)
 
-    # Синхронизация слэш-команд
+    # Мгновенная регистрация слэш-команд на серверах
+    for guild in bot.guilds:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            logger.info(f"⚡ Слэш-команды мгновенно зарегистрированы на '{guild.name}': {len(synced)}")
+        except Exception as e:
+            logger.warning(f"Ошибка регистрации слэш-команд на '{guild.name}': {e}")
+
     try:
-        synced = await bot.tree.sync()
-        logger.info(f"⚡ Синхронизировано слэш-команд: {len(synced)}")
-    except Exception as e:
-        logger.exception(f"Ошибка синхронизации слэш-команд: {e}")
+        await bot.tree.sync()
+    except Exception:
+        pass
 
     logger.info("🛡️ Модули логирования активированы и готовы к работе.")
     logger.info("=" * 60)

@@ -111,9 +111,21 @@ class StatusCog(commands.Cog):
 
     @commands.command(name="status")
     async def status_prefix(self, ctx: commands.Context):
-        """Текстовая команда !status (резервная)"""
+        """Текстовая команда !status"""
         embed = self._build_status_embed()
         await ctx.send(embed=embed)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Перехват текстового ввода /status, !status, .status если слэш еще не подтянулся в интерфейс"""
+        if message.author.bot or not message.guild:
+            return
+        if message.content.strip().lower() in ("/status", "!status", ".status"):
+            embed = self._build_status_embed()
+            try:
+                await message.channel.send(embed=embed)
+            except Exception:
+                pass
 
 
 async def setup(bot: commands.Bot):
