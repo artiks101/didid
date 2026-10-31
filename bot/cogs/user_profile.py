@@ -6,7 +6,7 @@ from typing import Optional, Union
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from bot.utils import LogColors
 
@@ -37,7 +37,10 @@ class UserActivityTracker:
 
     def __init__(self, db_path: Path = DB_FILE):
         self.db_path = str(db_path)
-        self._active_voice: dict[int, float] = {}  # member_id -> start_timestamp
+        # member_id -> (guild_id, last_flush_timestamp)
+        self._active_voice: dict[int, tuple[int, float]] = {}
+        # member_id -> session_start_timestamp (для вычисления непрерывной текущей сессии)
+        self._session_start: dict[int, float] = {}
         self._init_db()
 
     def _init_db(self):
@@ -82,22 +85,42 @@ class UserActivityTracker:
         except Exception:
             pass
 
-
-    def voice_join(self, user_id: int):
-        self._active_voice[user_id] = time.time()
+    def voice_join(self, user_id: int, guild_id: int):
+        now = time.time()
+        self._active_voice[user_id] = (guild_id, now)
+        if user_id not in self._session_start:
+            self._session_start[user_id] = now
 
     def voice_leave(self, user_id: int, guild_id: int):
-        start = self._active_voice.pop(user_id, None)
-        if start:
-            duration = time.time() - start
-            self.add_voice_seconds(user_id, guild_id, duration)
+        now = time.time()
+        info = self._active_voice.pop(user_id, None)
+        self._session_start.pop(user_id, None)
+        if info:
+            g_id, last_time = info
+            elapsed = now - last_time
+            if elapsed > 0:
+                self.add_voice_seconds(user_id, g_id or guild_id, elapsed)
 
     def voice_switch(self, user_id: int, guild_id: int):
-        start = self._active_voice.get(user_id)
-        if start:
-            duration = time.time() - start
-            self.add_voice_seconds(user_id, guild_id, duration)
-        self._active_voice[user_id] = time.time()
+        now = time.time()
+        info = self._active_voice.get(user_id)
+        if info:
+            g_id, last_time = info
+            elapsed = now - last_time
+            if elapsed > 0:
+                self.add_voice_seconds(user_id, g_id or guild_id, elapsed)
+        self._active_voice[user_id] = (guild_id, now)
+
+    def flush_all(self):
+        """Регулярно сохраняет накопленное голосовое время всех активных участников в SQLite."""
+        if not self._active_voice:
+            return
+        now = time.time()
+        for user_id, (guild_id, last_time) in list(self._active_voice.items()):
+            elapsed = now - last_time
+            if elapsed > 0:
+                self.add_voice_seconds(user_id, guild_id, elapsed)
+                self._active_voice[user_id] = (guild_id, now)
 
     def get_stats(self, user_id: int, guild_id: int) -> tuple[int, float, Optional[float]]:
         msg_count = 0
@@ -124,11 +147,15 @@ class UserActivityTracker:
         except Exception:
             pass
 
-        # Если участник прямо сейчас в голосовом канале
+        # Если участник прямо сейчас в голосовом канале:
+        # к уже сохраненным в БД секундам прибавляем несинхронизированные секунды текущего интервала
         if user_id in self._active_voice:
-            session_dur = time.time() - self._active_voice[user_id]
-            voice_secs += session_dur
-            current_session = session_dur
+            _, last_time = self._active_voice[user_id]
+            unflushed = max(0.0, time.time() - last_time)
+            voice_secs += unflushed
+
+            start_sess = self._session_start.get(user_id, last_time)
+            current_session = max(0.0, time.time() - start_sess)
 
         return msg_count, voice_secs, current_session
 
@@ -141,15 +168,33 @@ class UserProfileCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.sync_voice_activity.start()
+
+    def cog_unload(self):
+        self.sync_voice_activity.cancel()
+        tracker.flush_all()
+
+    @tasks.loop(seconds=15)
+    async def sync_voice_activity(self):
+        """Каждые 15 секунд сбрасывает голосовое время в SQLite, предотвращая потерю данных при перезагрузках."""
+        try:
+            tracker.flush_all()
+        except Exception:
+            pass
+
+    @sync_voice_activity.before_loop
+    async def before_sync(self):
+        await self.bot.wait_until_ready()
 
     @commands.Cog.listener()
     async def on_ready(self):
         # Инициализируем голосовые сессии для участников, которые уже сидят в войсе
         for guild in self.bot.guilds:
-            for voice_channel in guild.voice_channels:
+            channels = list(guild.voice_channels) + list(guild.stage_channels)
+            for voice_channel in channels:
                 for member in voice_channel.members:
                     if not member.bot and member.id not in tracker._active_voice:
-                        tracker.voice_join(member.id)
+                        tracker.voice_join(member.id, guild.id)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -193,7 +238,7 @@ class UserProfileCog(commands.Cog):
 
         # Подключение к каналу
         if before.channel is None and after.channel is not None:
-            tracker.voice_join(member.id)
+            tracker.voice_join(member.id, member.guild.id)
         # Отключение от канала
         elif before.channel is not None and after.channel is None:
             tracker.voice_leave(member.id, member.guild.id)
