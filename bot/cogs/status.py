@@ -105,27 +105,38 @@ class StatusCog(commands.Cog):
 
     @app_commands.command(name="status", description="Показывает текущий статус и статистику работы бота")
     async def status_slash(self, interaction: discord.Interaction):
-        """Слэш-команда /status"""
+        """Слэш-команда /status (видна только вызвавшему)"""
         embed = self._build_status_embed()
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @commands.command(name="status")
     async def status_prefix(self, ctx: commands.Context):
         """Текстовая команда !status"""
         embed = self._build_status_embed()
-        await ctx.send(embed=embed)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+        try:
+            await ctx.author.send(embed=embed)
+        except Exception:
+            await ctx.send(embed=embed, delete_after=20)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Перехват текстового ввода /status, !status, .status если слэш еще не подтянулся в интерфейс"""
+        """Перехват текстового ввода /status, если отправлено текстом в чат"""
         if message.author.bot or not message.guild:
             return
         if message.content.strip().lower() in ("/status", "!status", ".status"):
             embed = self._build_status_embed()
             try:
-                await message.channel.send(embed=embed)
+                await message.delete()
             except Exception:
                 pass
+            try:
+                await message.author.send(embed=embed)
+            except Exception:
+                await message.channel.send(embed=embed, delete_after=20)
 
 
 async def setup(bot: commands.Bot):
