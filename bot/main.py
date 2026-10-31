@@ -88,6 +88,14 @@ async def on_ready():
         name="за действиями администраторов"
     )
     await bot.change_presence(status=discord.Status.online, activity=activity)
+
+    # Синхронизация слэш-команд
+    try:
+        synced = await bot.tree.sync()
+        logger.info(f"⚡ Синхронизировано слэш-команд: {len(synced)}")
+    except Exception as e:
+        logger.exception(f"Ошибка синхронизации слэш-команд: {e}")
+
     logger.info("🛡️ Модули логирования активированы и готовы к работе.")
     logger.info("=" * 60)
 
@@ -105,6 +113,7 @@ async def main():
     initial_extensions = [
         "bot.cogs.audit_logs",
         "bot.cogs.direct_events",
+        "bot.cogs.status",
     ]
 
     for ext in initial_extensions:
