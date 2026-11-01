@@ -38,6 +38,13 @@ class Config:
     except ValueError:
         CHAT_TOP_ROLE_ID: int = 1566479181821247681
 
+    # ID AFK канала (время нахождения в котором нигде не учитывается)
+    raw_afk_channel_id = os.getenv("AFK_CHANNEL_ID", "1546888695116996618").strip()
+    try:
+        AFK_CHANNEL_ID: int = int(raw_afk_channel_id) if raw_afk_channel_id else 1546888695116996618
+    except ValueError:
+        AFK_CHANNEL_ID: int = 1546888695116996618
+
     # ID конкретного сервера (если задан)
     raw_guild_id = os.getenv("GUILD_ID", "").strip()
     try:

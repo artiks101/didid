@@ -8,9 +8,22 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from bot.config import Config
 from bot.utils import LogColors
 
 DB_FILE = Path(__file__).resolve().parent.parent.parent / "messages.db"
+
+
+def is_afk_channel(channel: Optional[Union[discord.VoiceChannel, discord.StageChannel, discord.abc.GuildChannel]]) -> bool:
+    """Проверяет, является ли канал AFK-каналом (по явному ID или серверной настройке afk_channel)."""
+    if not channel:
+        return False
+    if channel.id == Config.AFK_CHANNEL_ID:
+        return True
+    guild = getattr(channel, "guild", None)
+    if guild and getattr(guild, "afk_channel", None) and channel.id == guild.afk_channel.id:
+        return True
+    return False
 
 
 def format_voice_duration(seconds: float) -> str:
@@ -457,10 +470,12 @@ class UserProfileCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        # Инициализируем голосовые сессии для участников, которые уже сидят в войсе
+        # Инициализируем голосовые сессии для участников, которые уже сидят в войсе (пропуская AFK)
         for guild in self.bot.guilds:
             channels = list(guild.voice_channels) + list(guild.stage_channels)
             for voice_channel in channels:
+                if is_afk_channel(voice_channel):
+                    continue
                 for member in voice_channel.members:
                     if not member.bot and member.id not in tracker._active_voice:
                         tracker.voice_join(member.id, guild.id)
@@ -505,14 +520,17 @@ class UserProfileCog(commands.Cog):
         if member.bot or not member.guild:
             return
 
-        # Подключение к каналу
-        if before.channel is None and after.channel is not None:
+        before_afk = is_afk_channel(before.channel)
+        after_afk = is_afk_channel(after.channel)
+
+        # 1. Подключение к обычному войсу (из оффлайна или переход из AFK)
+        if (before.channel is None or before_afk) and (after.channel is not None and not after_afk):
             tracker.voice_join(member.id, member.guild.id)
-        # Отключение от канала
-        elif before.channel is not None and after.channel is None:
+        # 2. Отключение от войса или переход в AFK канал
+        elif (before.channel is not None and not before_afk) and (after.channel is None or after_afk):
             tracker.voice_leave(member.id, member.guild.id)
-        # Переход между каналами
-        elif before.channel and after.channel and before.channel.id != after.channel.id:
+        # 3. Переход между разными обычными (не AFK) каналами
+        elif before.channel and after.channel and not before_afk and not after_afk and before.channel.id != after.channel.id:
             tracker.voice_switch(member.id, member.guild.id)
 
     @commands.Cog.listener()
@@ -548,7 +566,10 @@ class UserProfileCog(commands.Cog):
         # Голосовое время
         voice_str = format_voice_duration(voice_secs)
         voice_extra = ""
-        if current_session is not None and hasattr(member, "voice") and member.voice and member.voice.channel:
+        in_afk = hasattr(member, "voice") and member.voice and member.voice.channel and is_afk_channel(member.voice.channel)
+        if in_afk:
+            voice_extra = "\n💤 *Сейчас в AFK канале (время не учитывается)*"
+        elif current_session is not None and hasattr(member, "voice") and member.voice and member.voice.channel:
             voice_extra = f"\n🟢 *Сейчас в <#{member.voice.channel.id}> ({format_voice_duration(current_session)})*"
 
         # Победы в Топ-1 месяца
