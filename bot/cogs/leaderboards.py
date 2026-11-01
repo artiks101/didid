@@ -309,32 +309,44 @@ class LeaderboardsCog(commands.Cog):
 
             rules_embed = build_rules_embed(guild)
 
-            # 1. Первое сообщение: Голосовой топ
-            if voice_msg:
-                try:
-                    await voice_msg.edit(embed=voice_embed, view=voice_view)
-                except Exception:
-                    voice_msg = await channel.send(embed=voice_embed, view=voice_view)
-            else:
-                voice_msg = await channel.send(embed=voice_embed, view=voice_view)
+            # Проверяем, существуют ли все 3 сообщения и идут ли они в правильном порядке:
+            # 1: Правила -> 2: Голосовой топ -> 3: Топ сообщений
+            in_correct_order = (
+                rules_msg is not None and
+                voice_msg is not None and
+                msgs_msg is not None and
+                rules_msg.id != voice_msg.id and
+                voice_msg.id != msgs_msg.id and
+                rules_msg.created_at < voice_msg.created_at < msgs_msg.created_at
+            )
 
-            # 2. Второе сообщение: Топ по сообщениям
-            if msgs_msg:
-                try:
-                    await msgs_msg.edit(embed=msgs_embed, view=msgs_view)
-                except Exception:
-                    msgs_msg = await channel.send(embed=msgs_embed, view=msgs_view)
-            else:
-                msgs_msg = await channel.send(embed=msgs_embed, view=msgs_view)
-
-            # 3. Третье сообщение: Правила и условия наград
-            if rules_msg:
+            if in_correct_order:
                 try:
                     await rules_msg.edit(embed=rules_embed)
-                except Exception:
-                    rules_msg = await channel.send(embed=rules_embed)
-            else:
+                    await voice_msg.edit(embed=voice_embed, view=voice_view)
+                    await msgs_msg.edit(embed=msgs_embed, view=msgs_view)
+                except Exception as e:
+                    logger.warning(f"Ошибка при обновлении карточек: {e}")
+                    in_correct_order = False
+
+            if not in_correct_order:
+                # Если порядок нарушен или сообщения отсутствуют, очищаем старые карточки бота и отправляем в строгом порядке
+                all_bot_msgs = list({
+                    m.id: m for m in (existing_rules_msgs + existing_voice_msgs + existing_text_msgs)
+                }.values())
+
+                for old_m in all_bot_msgs:
+                    try:
+                        await old_m.delete()
+                    except Exception:
+                        pass
+
+                # 1. Первое сообщение: Правила и условия наград
                 rules_msg = await channel.send(embed=rules_embed)
+                # 2. Второе сообщение: Голосовой топ
+                voice_msg = await channel.send(embed=voice_embed, view=voice_view)
+                # 3. Третье сообщение: Топ по сообщениям
+                msgs_msg = await channel.send(embed=msgs_embed, view=msgs_view)
 
             # Сохраняем актуальные ID всех 3 сообщений
             tracker.save_top_message_ids(
