@@ -197,6 +197,8 @@ class UserActivityTracker:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("DELETE FROM messages WHERE author_id=?", (user_id,))
                 conn.execute("DELETE FROM recent_deletions WHERE author_id=?", (user_id,))
+                conn.execute("UPDATE monthly_rewards SET voice_winner_id=NULL WHERE voice_winner_id=?", (user_id,))
+                conn.execute("UPDATE monthly_rewards SET chat_winner_id=NULL WHERE chat_winner_id=?", (user_id,))
                 conn.commit()
         except Exception:
             pass
@@ -363,6 +365,32 @@ class UserActivityTracker:
         except Exception:
             pass
 
+    def get_user_wins(self, user_id: int, guild_id: int) -> tuple[int, int]:
+        """Возвращает (voice_wins, chat_wins) для участника."""
+        voice_wins = 0
+        chat_wins = 0
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT COUNT(*) FROM monthly_rewards WHERE guild_id=? AND voice_winner_id=?",
+                    (guild_id, user_id)
+                )
+                row_v = cursor.fetchone()
+                if row_v:
+                    voice_wins = row_v[0] or 0
+
+                cursor.execute(
+                    "SELECT COUNT(*) FROM monthly_rewards WHERE guild_id=? AND chat_winner_id=?",
+                    (guild_id, user_id)
+                )
+                row_c = cursor.fetchone()
+                if row_c:
+                    chat_wins = row_c[0] or 0
+        except Exception:
+            pass
+        return voice_wins, chat_wins
+
     def get_stats(self, user_id: int, guild_id: int) -> tuple[int, float, Optional[float]]:
         msg_count = 0
         voice_secs = 0.0
@@ -506,6 +534,7 @@ class UserProfileCog(commands.Cog):
         guild = getattr(member, "guild", None)
         guild_id = guild.id if guild else 0
         msg_count, voice_secs, current_session = tracker.get_stats(member.id, guild_id)
+        voice_wins, chat_wins = tracker.get_user_wins(member.id, guild_id)
 
         # Время на сервере
         if hasattr(member, "joined_at") and member.joined_at:
@@ -521,6 +550,11 @@ class UserProfileCog(commands.Cog):
         voice_extra = ""
         if current_session is not None and hasattr(member, "voice") and member.voice and member.voice.channel:
             voice_extra = f"\n🟢 *Сейчас в <#{member.voice.channel.id}> ({format_voice_duration(current_session)})*"
+
+        # Победы в Топ-1 месяца
+        v_crown = " 👑" if voice_wins > 0 else ""
+        c_crown = " 👑" if chat_wins > 0 else ""
+        wins_str = f"🎙️ В голосе: **{voice_wins}**{v_crown} • 💬 В чате: **{chat_wins}**{c_crown}"
 
         # Роли участника (без @everyone)
         roles = [r.mention for r in reversed(member.roles[1:])] if hasattr(member, "roles") else []
@@ -544,6 +578,7 @@ class UserProfileCog(commands.Cog):
         embed.add_field(name="📅 На сервере", value=days_str, inline=False)
         embed.add_field(name="💬 Написано сообщений", value=f"**{msg_count}** сообщений", inline=True)
         embed.add_field(name="🎙️ Время в голосовых", value=f"**{voice_str}**{voice_extra}", inline=True)
+        embed.add_field(name="🏆 Победы в Топ-1 месяца", value=wins_str, inline=False)
         embed.add_field(name=roles_label, value=roles_str, inline=False)
 
         created_str = member.created_at.strftime('%d.%m.%Y') if hasattr(member, "created_at") and member.created_at else "Н/Д"
