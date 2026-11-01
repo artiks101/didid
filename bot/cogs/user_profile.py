@@ -55,11 +55,39 @@ class UserActivityTracker:
                         PRIMARY KEY (user_id, guild_id)
                     )
                 """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS activity_daily (
+                        user_id INTEGER,
+                        guild_id INTEGER,
+                        date TEXT,
+                        message_count INTEGER DEFAULT 0,
+                        voice_seconds REAL DEFAULT 0,
+                        PRIMARY KEY (user_id, guild_id, date)
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_act_daily ON activity_daily(guild_id, date)")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS top_messages (
+                        guild_id INTEGER PRIMARY KEY,
+                        voice_msg_id INTEGER,
+                        messages_msg_id INTEGER
+                    )
+                """)
+                # Миграция: если таблица activity_daily пуста, заполняем текущими данными из user_activity
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM activity_daily")
+                if cursor.fetchone()[0] == 0:
+                    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    conn.execute("""
+                        INSERT OR IGNORE INTO activity_daily (user_id, guild_id, date, message_count, voice_seconds)
+                        SELECT user_id, guild_id, ?, message_count, voice_seconds FROM user_activity
+                    """, (today,))
                 conn.commit()
         except Exception:
             pass
 
     def increment_messages(self, user_id: int, guild_id: int):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
@@ -67,6 +95,11 @@ class UserActivityTracker:
                     VALUES (?, ?, 1, 0)
                     ON CONFLICT(user_id, guild_id) DO UPDATE SET message_count = message_count + 1
                 """, (user_id, guild_id))
+                conn.execute("""
+                    INSERT INTO activity_daily (user_id, guild_id, date, message_count, voice_seconds)
+                    VALUES (?, ?, ?, 1, 0)
+                    ON CONFLICT(user_id, guild_id, date) DO UPDATE SET message_count = message_count + 1
+                """, (user_id, guild_id, today))
                 conn.commit()
         except Exception:
             pass
@@ -74,6 +107,7 @@ class UserActivityTracker:
     def add_voice_seconds(self, user_id: int, guild_id: int, seconds: float):
         if seconds <= 0:
             return
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
@@ -81,6 +115,11 @@ class UserActivityTracker:
                     VALUES (?, ?, 0, ?)
                     ON CONFLICT(user_id, guild_id) DO UPDATE SET voice_seconds = voice_seconds + ?
                 """, (user_id, guild_id, seconds, seconds))
+                conn.execute("""
+                    INSERT INTO activity_daily (user_id, guild_id, date, message_count, voice_seconds)
+                    VALUES (?, ?, ?, 0, ?)
+                    ON CONFLICT(user_id, guild_id, date) DO UPDATE SET voice_seconds = voice_seconds + ?
+                """, (user_id, guild_id, today, seconds, seconds))
                 conn.commit()
         except Exception:
             pass
@@ -131,8 +170,10 @@ class UserActivityTracker:
             with sqlite3.connect(self.db_path) as conn:
                 if guild_id:
                     conn.execute("DELETE FROM user_activity WHERE user_id=? AND guild_id=?", (user_id, guild_id))
+                    conn.execute("DELETE FROM activity_daily WHERE user_id=? AND guild_id=?", (user_id, guild_id))
                 else:
                     conn.execute("DELETE FROM user_activity WHERE user_id=?", (user_id,))
+                    conn.execute("DELETE FROM activity_daily WHERE user_id=?", (user_id,))
                 conn.commit()
         except Exception:
             pass
@@ -141,6 +182,119 @@ class UserActivityTracker:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("DELETE FROM messages WHERE author_id=?", (user_id,))
                 conn.execute("DELETE FROM recent_deletions WHERE author_id=?", (user_id,))
+                conn.commit()
+        except Exception:
+            pass
+
+    def get_top_voice(self, guild_id: int, period: str = "week", limit: int = 10) -> list[tuple[int, float]]:
+        """
+        Возвращает топ участников по голосовому времени: [(user_id, voice_seconds), ...]
+        period: 'week' (7 дней), 'month' (30 дней), 'all' (всё время)
+        """
+        self.flush_all()
+        results = []
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                if period == "week":
+                    cursor.execute("""
+                        SELECT user_id, SUM(voice_seconds) as total
+                        FROM activity_daily
+                        WHERE guild_id = ? AND date >= date('now', '-7 days')
+                        GROUP BY user_id
+                        HAVING total > 0
+                        ORDER BY total DESC
+                        LIMIT ?
+                    """, (guild_id, limit))
+                elif period == "month":
+                    cursor.execute("""
+                        SELECT user_id, SUM(voice_seconds) as total
+                        FROM activity_daily
+                        WHERE guild_id = ? AND date >= date('now', '-30 days')
+                        GROUP BY user_id
+                        HAVING total > 0
+                        ORDER BY total DESC
+                        LIMIT ?
+                    """, (guild_id, limit))
+                else:  # all
+                    cursor.execute("""
+                        SELECT user_id, voice_seconds as total
+                        FROM user_activity
+                        WHERE guild_id = ? AND voice_seconds > 0
+                        ORDER BY total DESC
+                        LIMIT ?
+                    """, (guild_id, limit))
+                results = cursor.fetchall()
+        except Exception:
+            pass
+        return results
+
+    def get_top_messages(self, guild_id: int, period: str = "week", limit: int = 10) -> list[tuple[int, int]]:
+        """
+        Возвращает топ участников по сообщениям: [(user_id, message_count), ...]
+        period: 'week' (7 дней), 'month' (30 дней), 'all' (всё время)
+        """
+        results = []
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                if period == "week":
+                    cursor.execute("""
+                        SELECT user_id, SUM(message_count) as total
+                        FROM activity_daily
+                        WHERE guild_id = ? AND date >= date('now', '-7 days')
+                        GROUP BY user_id
+                        HAVING total > 0
+                        ORDER BY total DESC
+                        LIMIT ?
+                    """, (guild_id, limit))
+                elif period == "month":
+                    cursor.execute("""
+                        SELECT user_id, SUM(message_count) as total
+                        FROM activity_daily
+                        WHERE guild_id = ? AND date >= date('now', '-30 days')
+                        GROUP BY user_id
+                        HAVING total > 0
+                        ORDER BY total DESC
+                        LIMIT ?
+                    """, (guild_id, limit))
+                else:  # all
+                    cursor.execute("""
+                        SELECT user_id, message_count as total
+                        FROM user_activity
+                        WHERE guild_id = ? AND message_count > 0
+                        ORDER BY total DESC
+                        LIMIT ?
+                    """, (guild_id, limit))
+                results = cursor.fetchall()
+        except Exception:
+            pass
+        return results
+
+    def get_top_message_ids(self, guild_id: int) -> tuple[Optional[int], Optional[int]]:
+        """Возвращает сохраненные ID сообщений для топов (voice_msg_id, messages_msg_id)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT voice_msg_id, messages_msg_id FROM top_messages WHERE guild_id=?", (guild_id,))
+                row = cursor.fetchone()
+                if row:
+                    return row[0], row[1]
+        except Exception:
+            pass
+        return None, None
+
+    def save_top_message_ids(self, guild_id: int, voice_msg_id: Optional[int], messages_msg_id: Optional[int]):
+        """Сохраняет ID сообщений топов в БД."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    INSERT INTO top_messages (guild_id, voice_msg_id, messages_msg_id)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(guild_id) DO UPDATE SET
+                        voice_msg_id = COALESCE(?, voice_msg_id),
+                        messages_msg_id = COALESCE(?, messages_msg_id)
+                """, (guild_id, voice_msg_id, messages_msg_id, voice_msg_id, messages_msg_id))
                 conn.commit()
         except Exception:
             pass

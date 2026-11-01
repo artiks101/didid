@@ -18,6 +18,13 @@ class Config:
     except ValueError:
         LOG_CHANNEL_ID: int = 0
 
+    # ID канала для публикации топов активности участников
+    raw_top_channel_id = os.getenv("TOP_CHANNEL_ID", "1566474940465680604").strip()
+    try:
+        TOP_CHANNEL_ID: int = int(raw_top_channel_id) if raw_top_channel_id else 1566474940465680604
+    except ValueError:
+        TOP_CHANNEL_ID: int = 1566474940465680604
+
     # ID конкретного сервера (если задан)
     raw_guild_id = os.getenv("GUILD_ID", "").strip()
     try:

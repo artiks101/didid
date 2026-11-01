@@ -143,6 +143,7 @@ async def main():
         "bot.cogs.direct_events",
         "bot.cogs.status",
         "bot.cogs.user_profile",
+        "bot.cogs.leaderboards",
     ]
 
     for ext in initial_extensions:
