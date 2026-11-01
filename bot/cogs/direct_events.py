@@ -142,64 +142,7 @@ class DirectEventsCog(commands.Cog):
             logger.exception(f"Ошибка при отправке лога удаления сообщения: {e}")
 
     # =========================================================================
-    # 3. Голосовые каналы (Voice States)
-    # =========================================================================
-    @commands.Cog.listener()
-    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-        if not member.guild or member.bot:
-            return
-
-        if not await is_admin(member.guild, member):
-            return
-
-        log_channel = self._get_log_channel(member.guild)
-        if not log_channel:
-            return
-
-        actor_label = get_actor_role_label(member, member.guild)
-
-        if before.channel is None and after.channel is not None:
-            embed = build_embed(
-                title=f"🔊 {actor_label} подключился к голосовому каналу",
-                color=LogColors.BLUE,
-                actor=member,
-                fields=[
-                    ("Канал", format_channel(after.channel), False),
-                ],
-                footer_text="Голосовой чат: ПОДКЛЮЧЕНИЕ",
-                guild=member.guild,
-            )
-            await log_channel.send(embed=embed)
-
-        elif before.channel is not None and after.channel is None:
-            embed = build_embed(
-                title=f"🔇 {actor_label} отключился от голосового канала",
-                color=LogColors.BLUE,
-                actor=member,
-                fields=[
-                    ("Канал", format_channel(before.channel), False),
-                ],
-                footer_text="Голосовой чат: ОТКЛЮЧЕНИЕ",
-                guild=member.guild,
-            )
-            await log_channel.send(embed=embed)
-
-        elif before.channel and after.channel and before.channel.id != after.channel.id:
-            embed = build_embed(
-                title=f"🔀 {actor_label} перешел в другой голосовой канал",
-                color=LogColors.BLUE,
-                actor=member,
-                fields=[
-                    ("Из канала", format_channel(before.channel), True),
-                    ("В канал", format_channel(after.channel), True),
-                ],
-                footer_text="Голосовой чат: ПЕРЕХОД",
-                guild=member.guild,
-            )
-            await log_channel.send(embed=embed)
-
-    # =========================================================================
-    # 4. Критическое событие: получение или потеря прав Администратора
+    # 3. Критическое событие: получение или потеря прав Администратора
     # =========================================================================
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
