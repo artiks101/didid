@@ -76,6 +76,60 @@ def build_messages_top_embed(guild: Optional[discord.Guild], period: str = "week
     return embed
 
 
+def build_rules_embed(guild: Optional[discord.Guild]) -> discord.Embed:
+    voice_role = guild.get_role(Config.VOICE_TOP_ROLE_ID) if guild else None
+    chat_role = guild.get_role(Config.CHAT_TOP_ROLE_ID) if guild else None
+
+    v_role_str = voice_role.mention if voice_role else f"`ID: {Config.VOICE_TOP_ROLE_ID}`"
+    c_role_str = chat_role.mention if chat_role else f"`ID: {Config.CHAT_TOP_ROLE_ID}`"
+
+    embed = discord.Embed(
+        title="📜 Правила и условия получения ежемесячных наград",
+        color=LogColors.PURPLE,
+        timestamp=discord.utils.utcnow()
+    )
+
+    embed.description = (
+        "Каждый месяц самые активные участники сервера соревнуются за эксклюзивные роли лидеров!\n"
+        "Подведение итогов и выдача наград происходит **автоматически в конце каждого месяца**."
+    )
+
+    embed.add_field(
+        name="🎙️ Награда за голосовой чат",
+        value=(
+            f"• **Роль:** {v_role_str}\n"
+            f"• **Условие:** Занять **1-е место** по времени нахождения в голосовых каналах за календарный месяц."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="💬 Награда за активность в текстовом чате",
+        value=(
+            f"• **Роль:** {c_role_str}\n"
+            f"• **Условие:** Занять **1-е место** по количеству отправленных сообщений за календарный месяц."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚖️ Правила и ограничения",
+        value=(
+            "1. **Смена победителей:** Роли выдаются ровно на один месяц. При наступлении нового месяца роли забираются у предыдущих лидеров и передаются новым.\n"
+            "2. **Одна роль в одни руки:** Один участник **не может** обладать сразу двумя этими ролями одновременно.\n"
+            "3. **Если участник занял 1-е место в обоих топах:**\n"
+            "   • Бот автоматически оценивает процентный отрыв от 2-го места в голосовом топе и в чате.\n"
+            "   • Участник получает ту роль, где его **отрыв от преследователя наибольший**.\n"
+            "   • Вторая роль автоматически достается участнику, занявшему **2-е место** в другом топе.\n"
+            "4. **Сброс при выходе:** Если участник покидает сервер или блокируется, вся его статистика в базе данных полностью аннулируется."
+        ),
+        inline=False
+    )
+
+    embed.set_footer(text="Discord Activity Rewards • Обновляется автоматически")
+    return embed
+
+
 class VoiceTopView(discord.ui.View):
     """Интерактивная панель переключения периодов топа по голосовому времени."""
 
@@ -164,7 +218,7 @@ class LeaderboardsCog(commands.Cog):
         self.auto_check_monthly_rewards.cancel()
 
     async def update_guild_leaderboard(self, guild: discord.Guild) -> bool:
-        """Обновляет или отправляет карточки топов в настроенный канал, очищая дубликаты."""
+        """Обновляет или отправляет карточки топов и правил в настроенный канал, очищая дубликаты."""
         async with self._lock:
             channel = self.bot.get_channel(Config.TOP_CHANNEL_ID)
             if not isinstance(channel, discord.TextChannel):
@@ -175,13 +229,15 @@ class LeaderboardsCog(commands.Cog):
                 logger.warning(f"Нет прав Send Messages или Embed Links в канале топов #{channel.name}")
                 return False
 
-            voice_msg_id, msgs_msg_id = tracker.get_top_message_ids(guild.id)
+            voice_msg_id, msgs_msg_id, rules_msg_id = tracker.get_top_message_ids(guild.id)
             voice_msg: Optional[discord.Message] = None
             msgs_msg: Optional[discord.Message] = None
+            rules_msg: Optional[discord.Message] = None
 
             # Ищем существующие карточки бота в истории канала для устранения дублирования
             existing_voice_msgs: list[discord.Message] = []
             existing_text_msgs: list[discord.Message] = []
+            existing_rules_msgs: list[discord.Message] = []
 
             try:
                 async for msg in channel.history(limit=30):
@@ -191,10 +247,12 @@ class LeaderboardsCog(commands.Cog):
                             existing_voice_msgs.append(msg)
                         elif "по сообщениям" in title:
                             existing_text_msgs.append(msg)
+                        elif "Правила и условия" in title:
+                            existing_rules_msgs.append(msg)
             except Exception as e:
                 logger.warning(f"Ошибка при проверке истории #{channel.name}: {e}")
 
-            # Если бот обнаружил дубликаты (например, от одновременных вызовов), удаляем лишние
+            # Если бот обнаружил дубликаты, удаляем лишние
             if len(existing_voice_msgs) > 1:
                 for extra in existing_voice_msgs[1:]:
                     try:
@@ -210,6 +268,14 @@ class LeaderboardsCog(commands.Cog):
                     except Exception:
                         pass
                 existing_text_msgs = existing_text_msgs[:1]
+
+            if len(existing_rules_msgs) > 1:
+                for extra in existing_rules_msgs[1:]:
+                    try:
+                        await extra.delete()
+                    except Exception:
+                        pass
+                existing_rules_msgs = existing_rules_msgs[:1]
 
             if existing_voice_msgs:
                 voice_msg = existing_voice_msgs[0]
@@ -227,13 +293,23 @@ class LeaderboardsCog(commands.Cog):
                 except (discord.NotFound, discord.HTTPException):
                     msgs_msg = None
 
+            if existing_rules_msgs:
+                rules_msg = existing_rules_msgs[0]
+            elif rules_msg_id:
+                try:
+                    rules_msg = await channel.fetch_message(rules_msg_id)
+                except (discord.NotFound, discord.HTTPException):
+                    rules_msg = None
+
             voice_embed = build_voice_top_embed(guild, period="week")
             voice_view = VoiceTopView(current_period="week")
 
             msgs_embed = build_messages_top_embed(guild, period="week")
             msgs_view = MessagesTopView(current_period="week")
 
-            # 1. Голосовой топ: редактируем существующее или отправляем новое
+            rules_embed = build_rules_embed(guild)
+
+            # 1. Первое сообщение: Голосовой топ
             if voice_msg:
                 try:
                     await voice_msg.edit(embed=voice_embed, view=voice_view)
@@ -242,7 +318,7 @@ class LeaderboardsCog(commands.Cog):
             else:
                 voice_msg = await channel.send(embed=voice_embed, view=voice_view)
 
-            # 2. Топ по сообщениям: редактируем существующее или отправляем новое
+            # 2. Второе сообщение: Топ по сообщениям
             if msgs_msg:
                 try:
                     await msgs_msg.edit(embed=msgs_embed, view=msgs_view)
@@ -251,11 +327,21 @@ class LeaderboardsCog(commands.Cog):
             else:
                 msgs_msg = await channel.send(embed=msgs_embed, view=msgs_view)
 
-            # Сохраняем актуальные ID сообщений
+            # 3. Третье сообщение: Правила и условия наград
+            if rules_msg:
+                try:
+                    await rules_msg.edit(embed=rules_embed)
+                except Exception:
+                    rules_msg = await channel.send(embed=rules_embed)
+            else:
+                rules_msg = await channel.send(embed=rules_embed)
+
+            # Сохраняем актуальные ID всех 3 сообщений
             tracker.save_top_message_ids(
                 guild.id,
                 voice_msg.id if voice_msg else None,
-                msgs_msg.id if msgs_msg else None
+                msgs_msg.id if msgs_msg else None,
+                rules_msg.id if rules_msg else None
             )
             return True
 

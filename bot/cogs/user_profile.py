@@ -70,9 +70,14 @@ class UserActivityTracker:
                     CREATE TABLE IF NOT EXISTS top_messages (
                         guild_id INTEGER PRIMARY KEY,
                         voice_msg_id INTEGER,
-                        messages_msg_id INTEGER
+                        messages_msg_id INTEGER,
+                        rules_msg_id INTEGER
                     )
                 """)
+                try:
+                    conn.execute("ALTER TABLE top_messages ADD COLUMN rules_msg_id INTEGER")
+                except Exception:
+                    pass
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS monthly_rewards (
                         guild_id INTEGER,
@@ -329,30 +334,31 @@ class UserActivityTracker:
         except Exception:
             pass
 
-    def get_top_message_ids(self, guild_id: int) -> tuple[Optional[int], Optional[int]]:
-        """Возвращает сохраненные ID сообщений для топов (voice_msg_id, messages_msg_id)."""
+    def get_top_message_ids(self, guild_id: int) -> tuple[Optional[int], Optional[int], Optional[int]]:
+        """Возвращает сохраненные ID сообщений для топов (voice_msg_id, messages_msg_id, rules_msg_id)."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT voice_msg_id, messages_msg_id FROM top_messages WHERE guild_id=?", (guild_id,))
+                cursor.execute("SELECT voice_msg_id, messages_msg_id, rules_msg_id FROM top_messages WHERE guild_id=?", (guild_id,))
                 row = cursor.fetchone()
                 if row:
-                    return row[0], row[1]
+                    return row[0], row[1], row[2]
         except Exception:
             pass
-        return None, None
+        return None, None, None
 
-    def save_top_message_ids(self, guild_id: int, voice_msg_id: Optional[int], messages_msg_id: Optional[int]):
-        """Сохраняет ID сообщений топов в БД."""
+    def save_top_message_ids(self, guild_id: int, voice_msg_id: Optional[int], messages_msg_id: Optional[int], rules_msg_id: Optional[int] = None):
+        """Сохраняет ID сообщений топов и правил в БД."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
-                    INSERT INTO top_messages (guild_id, voice_msg_id, messages_msg_id)
-                    VALUES (?, ?, ?)
+                    INSERT INTO top_messages (guild_id, voice_msg_id, messages_msg_id, rules_msg_id)
+                    VALUES (?, ?, ?, ?)
                     ON CONFLICT(guild_id) DO UPDATE SET
                         voice_msg_id = COALESCE(?, voice_msg_id),
-                        messages_msg_id = COALESCE(?, messages_msg_id)
-                """, (guild_id, voice_msg_id, messages_msg_id, voice_msg_id, messages_msg_id))
+                        messages_msg_id = COALESCE(?, messages_msg_id),
+                        rules_msg_id = COALESCE(?, rules_msg_id)
+                """, (guild_id, voice_msg_id, messages_msg_id, rules_msg_id, voice_msg_id, messages_msg_id, rules_msg_id))
                 conn.commit()
         except Exception:
             pass
