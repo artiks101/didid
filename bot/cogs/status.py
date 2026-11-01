@@ -95,7 +95,7 @@ class StatusCog(commands.Cog):
 
         embed.add_field(
             name="⚙️ Активные системы защиты",
-            value="• **Audit Logs** — отслеживание всех действий администрации\n• **Direct Events** — контроль сообщений и ролей администрации\n• **Message Tracker** — сохранение удаленного контента",
+            value="• **Audit Logs** — отслеживание всех действий администрации\n• **Direct Events** — контроль сообщений и ролей администрации\n• **Message Tracker** — сохранение удаленного контента\n• **Log Retention** — автоочистка отчетов старше 3 дней",
             inline=False,
         )
 

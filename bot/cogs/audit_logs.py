@@ -1,8 +1,9 @@
 import asyncio
 import logging
+from datetime import timedelta
 from typing import Optional, Tuple
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import AuditLogAction
 
 from bot.config import Config
@@ -28,6 +29,62 @@ class AuditLogsCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.auto_clean_old_logs.start()
+
+    def cog_unload(self):
+        self.auto_clean_old_logs.cancel()
+
+    @tasks.loop(hours=1)
+    async def auto_clean_old_logs(self):
+        """Автоматически удаляет отчеты старше 3 дней в канале логов."""
+        channel = self.bot.get_channel(Config.LOG_CHANNEL_ID)
+        if not isinstance(channel, discord.TextChannel):
+            return
+
+        perms = channel.permissions_for(channel.guild.me)
+        if not (perms.read_messages and perms.read_message_history and perms.manage_messages):
+            logger.warning(f"Нет прав Manage Messages для автоочистки логов в #{channel.name}")
+            return
+
+        now = discord.utils.utcnow()
+        cutoff = now - timedelta(days=3)
+        fourteen_days_ago = now - timedelta(days=14)
+
+        try:
+            # 1. Быстрое удаление пачками сообщений между 3 и 14 днями (Discord Bulk Delete API)
+            deleted = await channel.purge(
+                limit=500,
+                before=cutoff,
+                after=fourteen_days_ago,
+                bulk=True,
+                reason="Автоочистка отчетов старше 3 дней"
+            )
+            if deleted:
+                logger.info(f"🧹 Удалено {len(deleted)} старых отчетов (старше 3 дней) из #{channel.name}")
+
+            # 2. Если в канале остались архивные сообщения старше 14 дней, удаляем по одному
+            older_count = 0
+            async for old_msg in channel.history(limit=50, before=fourteen_days_ago):
+                try:
+                    await old_msg.delete()
+                    older_count += 1
+                    await asyncio.sleep(1.0)
+                except (discord.NotFound, discord.Forbidden):
+                    break
+                except Exception:
+                    pass
+
+            if older_count > 0:
+                logger.info(f"🧹 Удалено {older_count} архивных сообщений (старше 14 дней) из #{channel.name}")
+
+        except discord.Forbidden:
+            logger.warning(f"Нет прав на удаление сообщений в канале логов {channel.id}")
+        except Exception as e:
+            logger.exception(f"Ошибка при очистке отчетов старше 3 дней: {e}")
+
+    @auto_clean_old_logs.before_loop
+    async def before_auto_clean(self):
+        await self.bot.wait_until_ready()
 
     def _get_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
         """Возвращает канал для отправки логов."""
@@ -466,6 +523,8 @@ class AuditLogsCog(commands.Cog):
             extra = entry.extra
             count = getattr(extra, "count", 1) if extra else 1
             ch = getattr(extra, "channel", None) if extra else None
+            if ch and ch.id == Config.LOG_CHANNEL_ID:
+                return None, None
             ch_str = format_channel(ch) if ch else "`Неизвестный канал`"
 
             # Даем паузу 0.3 сек для завершения обработки события on_message_delete
