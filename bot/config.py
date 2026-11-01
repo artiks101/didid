@@ -25,6 +25,19 @@ class Config:
     except ValueError:
         TOP_CHANNEL_ID: int = 1566474940465680604
 
+    # Роли за победу в топах месяца (Топ-1 войс и Топ-1 чат)
+    raw_voice_role = os.getenv("VOICE_TOP_ROLE_ID", "1566478706422190141").strip()
+    try:
+        VOICE_TOP_ROLE_ID: int = int(raw_voice_role) if raw_voice_role else 1566478706422190141
+    except ValueError:
+        VOICE_TOP_ROLE_ID: int = 1566478706422190141
+
+    raw_chat_role = os.getenv("CHAT_TOP_ROLE_ID", "1566479181821247681").strip()
+    try:
+        CHAT_TOP_ROLE_ID: int = int(raw_chat_role) if raw_chat_role else 1566479181821247681
+    except ValueError:
+        CHAT_TOP_ROLE_ID: int = 1566479181821247681
+
     # ID конкретного сервера (если задан)
     raw_guild_id = os.getenv("GUILD_ID", "").strip()
     try:

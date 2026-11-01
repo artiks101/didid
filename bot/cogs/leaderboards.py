@@ -1,4 +1,5 @@
 import asyncio
+from datetime import timedelta
 import logging
 from typing import Optional
 import discord
@@ -156,9 +157,11 @@ class LeaderboardsCog(commands.Cog):
         self.bot = bot
         self._lock = asyncio.Lock()
         self.auto_refresh_tops.start()
+        self.auto_check_monthly_rewards.start()
 
     def cog_unload(self):
         self.auto_refresh_tops.cancel()
+        self.auto_check_monthly_rewards.cancel()
 
     async def update_guild_leaderboard(self, guild: discord.Guild) -> bool:
         """Обновляет или отправляет карточки топов в настроенный канал, очищая дубликаты."""
@@ -269,6 +272,198 @@ class LeaderboardsCog(commands.Cog):
     async def before_auto_refresh(self):
         await self.bot.wait_until_ready()
 
+    async def distribute_monthly_roles(self, guild: discord.Guild, target_month: Optional[str] = None) -> tuple[bool, str, Optional[discord.Embed]]:
+        """
+        Выдает ежемесячные роли победителям топов (по голосу и сообщениям):
+        - Снимает роли у предыдущих победителей
+        - Взаимное исключение: 1 участник не может иметь обе роли
+        - При лидерстве одного участника в обоих топах: роль отдается тому топу, где отрыв от 2-го места больше.
+          Вторая роль достается 2-му месту.
+        - Сохраняет факт вручения в БД и отправляет красивое объявление.
+        """
+        now = discord.utils.utcnow()
+        if not target_month:
+            if now.day == 1:
+                target_month = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+            else:
+                target_month = now.strftime("%Y-%m")
+
+        voice_top = tracker.get_top_voice(guild.id, limit=5, month_str=target_month)
+        chat_top = tracker.get_top_messages(guild.id, limit=5, month_str=target_month)
+
+        if not voice_top and not chat_top:
+            return False, f"Нет данных активности за месяц `{target_month}`.", None
+
+        voice_role = guild.get_role(Config.VOICE_TOP_ROLE_ID)
+        chat_role = guild.get_role(Config.CHAT_TOP_ROLE_ID)
+
+        if not voice_role and not chat_role:
+            return False, "Роли победителей (VOICE_TOP_ROLE_ID / CHAT_TOP_ROLE_ID) не найдены на сервере.", None
+
+        v1_id, v1_score = voice_top[0] if voice_top else (None, 0.0)
+        v2_id, v2_score = voice_top[1] if len(voice_top) > 1 else (None, 0.0)
+
+        c1_id, c1_score = chat_top[0] if chat_top else (None, 0)
+        c2_id, c2_score = chat_top[1] if len(chat_top) > 1 else (None, 0)
+
+        voice_winner_id: Optional[int] = None
+        chat_winner_id: Optional[int] = None
+        tie_details: Optional[str] = None
+
+        if v1_id is not None and c1_id is None:
+            voice_winner_id = v1_id
+        elif c1_id is not None and v1_id is None:
+            chat_winner_id = c1_id
+        elif v1_id != c1_id:
+            voice_winner_id = v1_id
+            chat_winner_id = c1_id
+        else:
+            # v1_id == c1_id: один участник на первом месте в обоих топах!
+            # Вычисляем относительный отрыв от 2-го места
+            if v2_score > 0:
+                v_margin = (v1_score - v2_score) / v2_score
+                v_margin_str = f"+{v_margin * 100:.1f}%"
+            else:
+                v_margin = 999999.0
+                v_margin_str = "абсолютный (нет 2-го места)"
+
+            if c2_score > 0:
+                c_margin = (c1_score - c2_score) / float(c2_score)
+                c_margin_str = f"+{c_margin * 100:.1f}%"
+            else:
+                c_margin = 999999.0
+                c_margin_str = "абсолютный (нет 2-го места)"
+
+            same_user = v1_id
+            if v_margin >= c_margin:
+                # Отрыв по голосу больше: отдаем голосовую роль, а роль чата отдаем 2-му месту
+                voice_winner_id = same_user
+                chat_winner_id = c2_id
+                tie_details = (
+                    f"⭐ Участник <@{same_user}> занял **1-е место в обоих топах**!\n"
+                    f"• Отрыв в голосовом топе: **{v_margin_str}**\n"
+                    f"• Отрыв в топе сообщений: **{c_margin_str}**\n"
+                    f"🎙️ По правилу наибольшего отрыва ему присвоена роль за голосовой чат!\n"
+                    f"💬 Роль за текстовый чат переходит ко **2-му месту** — <@{c2_id}>."
+                )
+            else:
+                # Отрыв по сообщениям больше: отдаем роль чата, а голосовую роль отдаем 2-му месту
+                chat_winner_id = same_user
+                voice_winner_id = v2_id
+                tie_details = (
+                    f"⭐ Участник <@{same_user}> занял **1-е место в обоих топах**!\n"
+                    f"• Отрыв в топе сообщений: **{c_margin_str}**\n"
+                    f"• Отрыв в голосовом топе: **{v_margin_str}**\n"
+                    f"💬 По правилу наибольшего отрыва ему присвоена роль за текстовый чат!\n"
+                    f"🎙️ Роль за голосовой чат переходит ко **2-му месту** — <@{v2_id}>."
+                )
+
+        # 1. Забираем роли у предыдущих победителей
+        if voice_role:
+            for member in voice_role.members:
+                if member.id != voice_winner_id:
+                    try:
+                        await member.remove_roles(voice_role, reason=f"Смена победителя голосового топа за {target_month}")
+                    except Exception as e:
+                        logger.warning(f"Не удалось снять роль голоса у {member.name}: {e}")
+
+        if chat_role:
+            for member in chat_role.members:
+                if member.id != chat_winner_id:
+                    try:
+                        await member.remove_roles(chat_role, reason=f"Смена победителя топа сообщений за {target_month}")
+                    except Exception as e:
+                        logger.warning(f"Не удалось снять роль чата у {member.name}: {e}")
+
+        # 2. Выдаем роли новым победителям
+        if voice_role and voice_winner_id:
+            m = guild.get_member(voice_winner_id)
+            if m and voice_role not in m.roles:
+                try:
+                    await m.add_roles(voice_role, reason=f"Победитель голосового топа за {target_month}")
+                except Exception as e:
+                    logger.warning(f"Не удалось выдать роль голоса {m.name}: {e}")
+
+        if chat_role and chat_winner_id:
+            m = guild.get_member(chat_winner_id)
+            if m and chat_role not in m.roles:
+                try:
+                    await m.add_roles(chat_role, reason=f"Победитель топа сообщений за {target_month}")
+                except Exception as e:
+                    logger.warning(f"Не удалось выдать роль чата {m.name}: {e}")
+
+        # Записываем факт награждения в SQLite
+        tracker.record_month_reward(guild.id, target_month, voice_winner_id, chat_winner_id)
+
+        # 3. Формируем объявление
+        embed = discord.Embed(
+            title=f"👑 Итоги месяца ({target_month}) и вручение ролей!",
+            color=LogColors.PURPLE,
+            timestamp=discord.utils.utcnow()
+        )
+
+        v_mention = f"<@{voice_winner_id}>" if voice_winner_id else "`Никто`"
+        v_role_mention = voice_role.mention if voice_role else f"`ID: {Config.VOICE_TOP_ROLE_ID}`"
+        v_stat = format_voice_duration(v1_score if voice_winner_id == v1_id else v2_score)
+
+        c_mention = f"<@{chat_winner_id}>" if chat_winner_id else "`Никто`"
+        c_role_mention = chat_role.mention if chat_role else f"`ID: {Config.CHAT_TOP_ROLE_ID}`"
+        c_stat = f"{c1_score if chat_winner_id == c1_id else c2_score} сообщений"
+
+        embed.add_field(
+            name="🎙️ Победитель голосового топа",
+            value=f"Участник: {v_mention}\nНаграда: {v_role_mention}\nРезультат: **{v_stat}**",
+            inline=False
+        )
+
+        embed.add_field(
+            name="💬 Победитель по сообщениям",
+            value=f"Участник: {c_mention}\nНаграда: {c_role_mention}\nРезультат: **{c_stat}**",
+            inline=False
+        )
+
+        if tie_details:
+            embed.add_field(name="⚖️ Разрешение ситуации двух первых мест", value=tie_details, inline=False)
+
+        embed.set_footer(text=f"Награды выданы • Роли действуют до конца следующего месяца")
+
+        # Отправляем в канал топов
+        top_channel = self.bot.get_channel(Config.TOP_CHANNEL_ID)
+        if isinstance(top_channel, discord.TextChannel):
+            try:
+                await top_channel.send(embed=embed)
+            except Exception:
+                pass
+
+        return True, f"Награды за `{target_month}` успешно распределены!", embed
+
+    @tasks.loop(hours=1)
+    async def auto_check_monthly_rewards(self):
+        """Ежечасно проверяет окончание месяца и автоматически выдает роли победителям."""
+        now = discord.utils.utcnow()
+        is_first_day = (now.day == 1)
+        next_day = now + timedelta(days=1)
+        is_last_day_late = (next_day.day == 1 and now.hour >= 23 and now.minute >= 45)
+
+        if not (is_first_day or is_last_day_late):
+            return
+
+        if is_first_day:
+            target_month = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+        else:
+            target_month = now.strftime("%Y-%m")
+
+        for guild in self.bot.guilds:
+            if not tracker.is_month_awarded(guild.id, target_month):
+                try:
+                    await self.distribute_monthly_roles(guild, target_month=target_month)
+                except Exception as e:
+                    logger.exception(f"Ошибка при автоматической выдаче наград за {target_month}: {e}")
+
+    @auto_check_monthly_rewards.before_loop
+    async def before_auto_monthly(self):
+        await self.bot.wait_until_ready()
+
     @commands.Cog.listener()
     async def on_ready(self):
         # Регистрируем персистентные кнопки для мгновенной обработки после перезапуска
@@ -294,6 +489,27 @@ class LeaderboardsCog(commands.Cog):
             await interaction.followup.send(f"✅ Карточки топов успешно обновлены в канале {ch_name}!", ephemeral=True)
         else:
             await interaction.followup.send(f"❌ Не удалось найти канал с ID `{Config.TOP_CHANNEL_ID}` или отсутствуют права на отправку.", ephemeral=True)
+
+    @app_commands.command(
+        name="reward_monthly",
+        description="[Администратор] Вручить ежемесячные роли победителям топов (по голосу и чату)"
+    )
+    @app_commands.describe(
+        month="Месяц в формате ГГГГ-ММ (например: 2026-11). Оставьте пустым для завершенного/текущего месяца"
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def reward_monthly_slash(self, interaction: discord.Interaction, month: Optional[str] = None):
+        """Ручной запуск распределения ежемесячных ролей"""
+        await interaction.response.defer(ephemeral=True)
+        if not interaction.guild:
+            await interaction.followup.send("❌ Команда доступна только на сервере.", ephemeral=True)
+            return
+
+        ok, msg, embed = await self.distribute_monthly_roles(interaction.guild, target_month=month)
+        if ok and embed:
+            await interaction.followup.send(f"✅ {msg}", embed=embed, ephemeral=True)
+        else:
+            await interaction.followup.send(f"⚠️ {msg}", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

@@ -73,6 +73,16 @@ class UserActivityTracker:
                         messages_msg_id INTEGER
                     )
                 """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS monthly_rewards (
+                        guild_id INTEGER,
+                        year_month TEXT,
+                        voice_winner_id INTEGER,
+                        chat_winner_id INTEGER,
+                        awarded_at REAL,
+                        PRIMARY KEY (guild_id, year_month)
+                    )
+                """)
                 # Миграция: если таблица activity_daily пуста, заполняем текущими данными из user_activity
                 cursor = conn.cursor()
                 cursor.execute("SELECT COUNT(*) FROM activity_daily")
@@ -186,17 +196,28 @@ class UserActivityTracker:
         except Exception:
             pass
 
-    def get_top_voice(self, guild_id: int, period: str = "week", limit: int = 10) -> list[tuple[int, float]]:
+    def get_top_voice(self, guild_id: int, period: str = "week", limit: int = 10, month_str: Optional[str] = None) -> list[tuple[int, float]]:
         """
         Возвращает топ участников по голосовому времени: [(user_id, voice_seconds), ...]
         period: 'week' (7 дней), 'month' (30 дней), 'all' (всё время)
+        month_str: если указан (например '2026-10'), фильтрует строго по этому календарному месяцу
         """
         self.flush_all()
         results = []
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                if period == "week":
+                if month_str:
+                    cursor.execute("""
+                        SELECT user_id, SUM(voice_seconds) as total
+                        FROM activity_daily
+                        WHERE guild_id = ? AND strftime('%Y-%m', date) = ?
+                        GROUP BY user_id
+                        HAVING total > 0
+                        ORDER BY total DESC
+                        LIMIT ?
+                    """, (guild_id, month_str, limit))
+                elif period == "week":
                     cursor.execute("""
                         SELECT user_id, SUM(voice_seconds) as total
                         FROM activity_daily
@@ -229,16 +250,27 @@ class UserActivityTracker:
             pass
         return results
 
-    def get_top_messages(self, guild_id: int, period: str = "week", limit: int = 10) -> list[tuple[int, int]]:
+    def get_top_messages(self, guild_id: int, period: str = "week", limit: int = 10, month_str: Optional[str] = None) -> list[tuple[int, int]]:
         """
         Возвращает топ участников по сообщениям: [(user_id, message_count), ...]
         period: 'week' (7 дней), 'month' (30 дней), 'all' (всё время)
+        month_str: если указан (например '2026-10'), фильтрует строго по этому календарному месяцу
         """
         results = []
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                if period == "week":
+                if month_str:
+                    cursor.execute("""
+                        SELECT user_id, SUM(message_count) as total
+                        FROM activity_daily
+                        WHERE guild_id = ? AND strftime('%Y-%m', date) = ?
+                        GROUP BY user_id
+                        HAVING total > 0
+                        ORDER BY total DESC
+                        LIMIT ?
+                    """, (guild_id, month_str, limit))
+                elif period == "week":
                     cursor.execute("""
                         SELECT user_id, SUM(message_count) as total
                         FROM activity_daily
@@ -270,6 +302,32 @@ class UserActivityTracker:
         except Exception:
             pass
         return results
+
+    def is_month_awarded(self, guild_id: int, year_month: str) -> bool:
+        """Проверяет, были ли уже выданы награды за указанный месяц."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1 FROM monthly_rewards WHERE guild_id=? AND year_month=?", (guild_id, year_month))
+                return cursor.fetchone() is not None
+        except Exception:
+            return False
+
+    def record_month_reward(self, guild_id: int, year_month: str, voice_winner_id: Optional[int], chat_winner_id: Optional[int]):
+        """Записывает факт вручения ежемесячных наград."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    INSERT INTO monthly_rewards (guild_id, year_month, voice_winner_id, chat_winner_id, awarded_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(guild_id, year_month) DO UPDATE SET
+                        voice_winner_id = excluded.voice_winner_id,
+                        chat_winner_id = excluded.chat_winner_id,
+                        awarded_at = excluded.awarded_at
+                """, (guild_id, year_month, voice_winner_id, chat_winner_id, time.time()))
+                conn.commit()
+        except Exception:
+            pass
 
     def get_top_message_ids(self, guild_id: int) -> tuple[Optional[int], Optional[int]]:
         """Возвращает сохраненные ID сообщений для топов (voice_msg_id, messages_msg_id)."""
