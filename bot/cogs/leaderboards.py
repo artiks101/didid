@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Optional
 import discord
@@ -153,69 +154,107 @@ class LeaderboardsCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._lock = asyncio.Lock()
         self.auto_refresh_tops.start()
 
     def cog_unload(self):
         self.auto_refresh_tops.cancel()
 
     async def update_guild_leaderboard(self, guild: discord.Guild) -> bool:
-        """Обновляет или отправляет карточки топов в настроенный канал."""
-        channel = self.bot.get_channel(Config.TOP_CHANNEL_ID)
-        if not isinstance(channel, discord.TextChannel):
-            return False
+        """Обновляет или отправляет карточки топов в настроенный канал, очищая дубликаты."""
+        async with self._lock:
+            channel = self.bot.get_channel(Config.TOP_CHANNEL_ID)
+            if not isinstance(channel, discord.TextChannel):
+                return False
 
-        perms = channel.permissions_for(guild.me)
-        if not (perms.send_messages and perms.embed_links):
-            logger.warning(f"Нет прав Send Messages или Embed Links в канале топов #{channel.name}")
-            return False
+            perms = channel.permissions_for(guild.me)
+            if not (perms.send_messages and perms.embed_links):
+                logger.warning(f"Нет прав Send Messages или Embed Links в канале топов #{channel.name}")
+                return False
 
-        voice_msg_id, msgs_msg_id = tracker.get_top_message_ids(guild.id)
-        voice_msg: Optional[discord.Message] = None
-        msgs_msg: Optional[discord.Message] = None
+            voice_msg_id, msgs_msg_id = tracker.get_top_message_ids(guild.id)
+            voice_msg: Optional[discord.Message] = None
+            msgs_msg: Optional[discord.Message] = None
 
-        if voice_msg_id:
+            # Ищем существующие карточки бота в истории канала для устранения дублирования
+            existing_voice_msgs: list[discord.Message] = []
+            existing_text_msgs: list[discord.Message] = []
+
             try:
-                voice_msg = await channel.fetch_message(voice_msg_id)
-            except (discord.NotFound, discord.HTTPException):
-                voice_msg = None
+                async for msg in channel.history(limit=30):
+                    if msg.author.id == self.bot.user.id and msg.embeds:
+                        title = msg.embeds[0].title or ""
+                        if "голосовому времени" in title:
+                            existing_voice_msgs.append(msg)
+                        elif "по сообщениям" in title:
+                            existing_text_msgs.append(msg)
+            except Exception as e:
+                logger.warning(f"Ошибка при проверке истории #{channel.name}: {e}")
 
-        if msgs_msg_id:
-            try:
-                msgs_msg = await channel.fetch_message(msgs_msg_id)
-            except (discord.NotFound, discord.HTTPException):
-                msgs_msg = None
+            # Если бот обнаружил дубликаты (например, от одновременных вызовов), удаляем лишние
+            if len(existing_voice_msgs) > 1:
+                for extra in existing_voice_msgs[1:]:
+                    try:
+                        await extra.delete()
+                    except Exception:
+                        pass
+                existing_voice_msgs = existing_voice_msgs[:1]
 
-        voice_embed = build_voice_top_embed(guild, period="week")
-        voice_view = VoiceTopView(current_period="week")
+            if len(existing_text_msgs) > 1:
+                for extra in existing_text_msgs[1:]:
+                    try:
+                        await extra.delete()
+                    except Exception:
+                        pass
+                existing_text_msgs = existing_text_msgs[:1]
 
-        msgs_embed = build_messages_top_embed(guild, period="week")
-        msgs_view = MessagesTopView(current_period="week")
+            if existing_voice_msgs:
+                voice_msg = existing_voice_msgs[0]
+            elif voice_msg_id:
+                try:
+                    voice_msg = await channel.fetch_message(voice_msg_id)
+                except (discord.NotFound, discord.HTTPException):
+                    voice_msg = None
 
-        # 1. Голосовой топ
-        if voice_msg:
-            try:
-                await voice_msg.edit(embed=voice_embed, view=voice_view)
-            except Exception:
+            if existing_text_msgs:
+                msgs_msg = existing_text_msgs[0]
+            elif msgs_msg_id:
+                try:
+                    msgs_msg = await channel.fetch_message(msgs_msg_id)
+                except (discord.NotFound, discord.HTTPException):
+                    msgs_msg = None
+
+            voice_embed = build_voice_top_embed(guild, period="week")
+            voice_view = VoiceTopView(current_period="week")
+
+            msgs_embed = build_messages_top_embed(guild, period="week")
+            msgs_view = MessagesTopView(current_period="week")
+
+            # 1. Голосовой топ: редактируем существующее или отправляем новое
+            if voice_msg:
+                try:
+                    await voice_msg.edit(embed=voice_embed, view=voice_view)
+                except Exception:
+                    voice_msg = await channel.send(embed=voice_embed, view=voice_view)
+            else:
                 voice_msg = await channel.send(embed=voice_embed, view=voice_view)
-        else:
-            voice_msg = await channel.send(embed=voice_embed, view=voice_view)
 
-        # 2. Топ по сообщениям
-        if msgs_msg:
-            try:
-                await msgs_msg.edit(embed=msgs_embed, view=msgs_view)
-            except Exception:
+            # 2. Топ по сообщениям: редактируем существующее или отправляем новое
+            if msgs_msg:
+                try:
+                    await msgs_msg.edit(embed=msgs_embed, view=msgs_view)
+                except Exception:
+                    msgs_msg = await channel.send(embed=msgs_embed, view=msgs_view)
+            else:
                 msgs_msg = await channel.send(embed=msgs_embed, view=msgs_view)
-        else:
-            msgs_msg = await channel.send(embed=msgs_embed, view=msgs_view)
 
-        # Сохраняем актуальные ID сообщений
-        tracker.save_top_message_ids(
-            guild.id,
-            voice_msg.id if voice_msg else None,
-            msgs_msg.id if msgs_msg else None
-        )
-        return True
+            # Сохраняем актуальные ID сообщений
+            tracker.save_top_message_ids(
+                guild.id,
+                voice_msg.id if voice_msg else None,
+                msgs_msg.id if msgs_msg else None
+            )
+            return True
 
     @tasks.loop(minutes=15)
     async def auto_refresh_tops(self):
@@ -235,13 +274,6 @@ class LeaderboardsCog(commands.Cog):
         # Регистрируем персистентные кнопки для мгновенной обработки после перезапуска
         self.bot.add_view(VoiceTopView("week"))
         self.bot.add_view(MessagesTopView("week"))
-
-        # Обновляем топы при старте бота
-        for guild in self.bot.guilds:
-            try:
-                await self.update_guild_leaderboard(guild)
-            except Exception as e:
-                logger.warning(f"Не удалось обновить топы при старте для '{guild.name}': {e}")
 
     @app_commands.command(
         name="updatetop",
@@ -266,3 +298,4 @@ class LeaderboardsCog(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(LeaderboardsCog(bot))
+
