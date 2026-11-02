@@ -67,10 +67,9 @@ class CardTheme:
     id: str = "default"
     name: str = "Discord Dark"
     card_bg: tuple[int, int, int, int] = (35, 36, 40, 255)         # #232428 (тело карточки)
-    card_border: tuple[int, int, int, int] = (55, 57, 63, 255)     # #37393f
-    banner_top: tuple[int, int, int] = (48, 51, 58)                # #30333a (верх шапки)
-    banner_bottom: tuple[int, int, int] = (24, 25, 29)             # #18191d (низ шапки)
-    banner_border: tuple[int, int, int, int] = (65, 68, 76, 255)   # Линия разделителя шапки и тела
+    card_border: tuple[int, int, int, int] = (50, 52, 58, 255)     # #32343a
+    banner_color: tuple[int, int, int, int] = (33, 35, 38, 255)    # #212326 (чистый сплошной цвет шапки по скриншоту 2)
+    banner_border: tuple[int, int, int, int] = (28, 30, 33, 255)   # #1c1e21 (аккуратный стык шапки и тела)
     banner_image_bytes: Optional[bytes] = None                      # Кастомный арт шапки (для покупки)
     card_bg_image_bytes: Optional[bytes] = None                     # Кастомный фон всей карточки (для покупки)
     box_bg: tuple[int, int, int, int] = (30, 31, 34, 255)          # #1e1f22 (плашки со статистикой)
@@ -158,18 +157,12 @@ def create_profile_card_image(
         except Exception:
             pass
     else:
-        banner = Image.new("RGBA", (w, banner_h), (0, 0, 0, 0))
-        b_draw = ImageDraw.Draw(banner)
-        for y in range(banner_h):
-            ratio = y / banner_h
-            r = int(active_theme.banner_top[0] * (1 - ratio) + active_theme.banner_bottom[0] * ratio)
-            g = int(active_theme.banner_top[1] * (1 - ratio) + active_theme.banner_bottom[1] * ratio)
-            b = int(active_theme.banner_top[2] * (1 - ratio) + active_theme.banner_bottom[2] * ratio)
-            b_draw.line([(0, y), (w, y)], fill=(r, g, b, 255))
+        # Сплошной матовый темный баннер без ступенчатых полос градиента (точно как на скриншоте 2)
+        banner = Image.new("RGBA", (w, banner_h), active_theme.banner_color)
         card.paste(banner, (0, 0), b_mask)
 
-    # Четкая линия-разделитель между шапкой и телом карточки (как в Figma)
-    draw.line([(0, banner_h), (w, banner_h)], fill=active_theme.banner_border, width=3)
+    # Аккуратная тонкая линия стыка шапки и тела
+    draw.line([(0, banner_h), (w, banner_h)], fill=active_theme.banner_border, width=2)
 
     # 3. Аватарка: Центр x=140, y=220 (аккуратно на линии стыка баннера), диаметр 160 (r=80)
     av_x, av_y, av_r = 140, 220, 80
