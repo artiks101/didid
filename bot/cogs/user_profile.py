@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from bot.card_generator import create_profile_card_image
+from bot.card_generator import create_profile_card_image, release_memory
 from bot.config import Config
 from bot.utils import LogColors
 
@@ -828,6 +828,11 @@ class UserProfileCog(commands.Cog):
             if card_buf:
                 file = discord.File(fp=card_buf, filename="profile_card.gif")
                 await interaction.followup.send(file=file, ephemeral=True)
+                try:
+                    card_buf.close()
+                except Exception:
+                    pass
+                release_memory()
             else:
                 embed = self._build_me_embed(target, is_self=is_self)
                 await interaction.followup.send(embed=embed, ephemeral=True)

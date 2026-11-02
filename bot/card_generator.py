@@ -1,3 +1,5 @@
+import ctypes
+import gc
 import io
 import re
 from dataclasses import dataclass, field
@@ -13,6 +15,15 @@ def clean_emoji_text(text: str) -> str:
     pattern = r"[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\u2b50-\u2b55\u200d\ufe0f]"
     cleaned = re.sub(pattern, "", text)
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def release_memory():
+    """Принудительно очищает мусор Python и возвращает выделенные страницы памяти в ОС (Linux glibc)."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 def get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
@@ -391,24 +402,35 @@ def create_profile_card_image(
         card.paste(bar, (0, 0), top_corner_mask)
         buffer = io.BytesIO()
         card.save(buffer, format="PNG")
+        card.close()
+        strip.close()
+        tcm_full.close()
+        release_memory()
         buffer.seek(0)
         return buffer
 
-    # Генерация 16-кадрового плавного циклического GIF
-    num_frames = 16
-    frames = []
-    bg_color = (49, 51, 56)  # Цвет темы Discord Dark для бесшовных скругленных углов
-    for i in range(num_frames):
+    # Генерация 8-кадрового плавного циклического GIF с минимальным расходом памяти
+    num_frames = 8
+    bg_color = (49, 51, 56)
+
+    # 1. Первый кадр для построения адаптивной палитры
+    flat0 = Image.new("RGB", (w, h), bg_color)
+    flat0.paste(card, (0, 0), card)
+    bar0 = strip.crop((0, 0, w, stripe_h))
+    flat0.paste(bar0, (0, 0), top_corner_mask)
+    pal_img = flat0.convert("P", palette=Image.Palette.ADAPTIVE, colors=256)
+    p_frames = [flat0.quantize(palette=pal_img, dither=Image.Dither.NONE)]
+    flat0.close()
+
+    # 2. Потоковая квантизация (в RAM находится только один полноразмерный кадр)
+    for i in range(1, num_frames):
         shift_px = int((i / num_frames) * w)
         bar = strip.crop((shift_px, 0, shift_px + w, stripe_h))
-        f = card.copy()
-        f.paste(bar, (0, 0), top_corner_mask)
-        flat = Image.new("RGB", (w, h), bg_color)
-        flat.paste(f, (0, 0), f)
-        frames.append(flat)
-
-    pal_img = frames[0].convert("P", palette=Image.Palette.ADAPTIVE, colors=256)
-    p_frames = [f.quantize(palette=pal_img, dither=Image.Dither.NONE) for f in frames]
+        frame_rgb = Image.new("RGB", (w, h), bg_color)
+        frame_rgb.paste(card, (0, 0), card)
+        frame_rgb.paste(bar, (0, 0), top_corner_mask)
+        p_frames.append(frame_rgb.quantize(palette=pal_img, dither=Image.Dither.NONE))
+        frame_rgb.close()
 
     buffer = io.BytesIO()
     p_frames[0].save(
@@ -416,9 +438,18 @@ def create_profile_card_image(
         format="GIF",
         save_all=True,
         append_images=p_frames[1:],
-        duration=65,
+        duration=90,
         loop=0
     )
+
+    for pf in p_frames:
+        pf.close()
+    del p_frames
+    card.close()
+    strip.close()
+    tcm_full.close()
+    release_memory()
+
     buffer.seek(0)
     return buffer
 
@@ -680,24 +711,35 @@ def create_leaderboard_card_image(
         card.paste(bar, (0, 0), top_corner_mask)
         buffer = io.BytesIO()
         card.save(buffer, format="PNG")
+        card.close()
+        strip.close()
+        tcm_full.close()
+        release_memory()
         buffer.seek(0)
         return buffer
 
-    # Генерация 8-кадрового плавного циклического GIF (быстрый рендер ~0.35s для моментального отклика)
+    # Генерация 8-кадрового плавного циклического GIF с минимальным расходом памяти
     num_frames = 8
-    frames = []
     bg_color = (49, 51, 56)
-    for i in range(num_frames):
+
+    # 1. Первый кадр для построения адаптивной палитры
+    flat0 = Image.new("RGB", (w, h), bg_color)
+    flat0.paste(card, (0, 0), card)
+    bar0 = strip.crop((0, 0, w, stripe_h))
+    flat0.paste(bar0, (0, 0), top_corner_mask)
+    pal_img = flat0.convert("P", palette=Image.Palette.ADAPTIVE, colors=256)
+    p_frames = [flat0.quantize(palette=pal_img, dither=Image.Dither.NONE)]
+    flat0.close()
+
+    # 2. Потоковая квантизация (в памяти одновременно только 1 полный RGB кадр)
+    for i in range(1, num_frames):
         shift_px = int((i / num_frames) * w)
         bar = strip.crop((shift_px, 0, shift_px + w, stripe_h))
-        f = card.copy()
-        f.paste(bar, (0, 0), top_corner_mask)
-        flat = Image.new("RGB", (w, h), bg_color)
-        flat.paste(f, (0, 0), f)
-        frames.append(flat)
-
-    pal_img = frames[0].convert("P", palette=Image.Palette.ADAPTIVE, colors=256)
-    p_frames = [f.quantize(palette=pal_img, dither=Image.Dither.NONE) for f in frames]
+        frame_rgb = Image.new("RGB", (w, h), bg_color)
+        frame_rgb.paste(card, (0, 0), card)
+        frame_rgb.paste(bar, (0, 0), top_corner_mask)
+        p_frames.append(frame_rgb.quantize(palette=pal_img, dither=Image.Dither.NONE))
+        frame_rgb.close()
 
     buffer = io.BytesIO()
     p_frames[0].save(
@@ -708,5 +750,14 @@ def create_leaderboard_card_image(
         duration=90,
         loop=0
     )
+
+    for pf in p_frames:
+        pf.close()
+    del p_frames
+    card.close()
+    strip.close()
+    tcm_full.close()
+    release_memory()
+
     buffer.seek(0)
     return buffer
