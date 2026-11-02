@@ -1,5 +1,6 @@
 import io
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 from PIL import Image, ImageDraw, ImageFont
@@ -60,26 +61,44 @@ def draw_clock_icon(draw: ImageDraw.ImageDraw, x: int, y: int, size: int = 20, c
     draw.line([(cx, cy), (cx + 5, cy)], fill=color, width=2)
 
 
-ACCENT_COLORS = [
-    (46, 204, 113),   # Зеленый
-    (26, 188, 156),   # Бирюзовый
-    (52, 152, 219),   # Синий
-    (155, 89, 182),   # Пурпурный
-    (235, 69, 158),   # Розовый
-    (46, 204, 113),   # Замыкание в зеленый для бесшовного цикла
-]
+@dataclass
+class CardTheme:
+    """Конфигурация темы/скина карточки профиля (для будущих кастомных дизайнов и магазина)."""
+    id: str = "default"
+    name: str = "Discord Dark"
+    card_bg: tuple[int, int, int, int] = (35, 36, 40, 255)         # #232428 (тело карточки)
+    card_border: tuple[int, int, int, int] = (55, 57, 63, 255)     # #37393f
+    banner_top: tuple[int, int, int] = (45, 47, 52)                # #2d2f34 (верх шапки)
+    banner_bottom: tuple[int, int, int] = (24, 25, 28)             # #18191c (низ шапки)
+    banner_image_bytes: Optional[bytes] = None                      # Кастомный арт шапки (для покупки)
+    card_bg_image_bytes: Optional[bytes] = None                     # Кастомный фон всей карточки (для покупки)
+    box_bg: tuple[int, int, int, int] = (30, 31, 34, 255)          # #1e1f22 (плашки со статистикой)
+    box_border: tuple[int, int, int, int] = (48, 50, 56, 255)      # #303238
+    voice_box_border: tuple[int, int, int, int] = (46, 204, 113, 255) # Неоновый зеленый
+    accent_colors: list[tuple[int, int, int]] = field(default_factory=lambda: [
+        (46, 204, 113),   # Зеленый
+        (26, 188, 156),   # Бирюзовый
+        (52, 152, 219),   # Синий
+        (155, 89, 182),   # Пурпурный
+        (235, 69, 158),   # Розовый
+        (46, 204, 113),   # Замыкание в зеленый
+    ])
 
 
-def create_accent_strip(w: int, h: int = 10) -> Image.Image:
+DEFAULT_THEME = CardTheme()
+
+
+def create_accent_strip(w: int, h: int = 10, colors: Optional[list[tuple[int, int, int]]] = None) -> Image.Image:
     """Генерирует бесшовную циклическую полоску градиента шириной 2 * w для плавной анимации."""
+    palette = colors or DEFAULT_THEME.accent_colors
     strip = Image.new("RGBA", (w * 2, h))
     draw = ImageDraw.Draw(strip)
-    n_segs = len(ACCENT_COLORS) - 1
+    n_segs = len(palette) - 1
     for x in range(w * 2):
         pos = (x / w) % 1.0
         seg = min(int(pos * n_segs), n_segs - 1)
         sub = (pos * n_segs) - seg
-        c1, c2 = ACCENT_COLORS[seg], ACCENT_COLORS[seg + 1]
+        c1, c2 = palette[seg], palette[seg + 1]
         r = int(c1[0] * (1 - sub) + c2[0] * sub)
         g = int(c1[1] * (1 - sub) + c2[1] * sub)
         b = int(c1[2] * (1 - sub) + c2[2] * sub)
@@ -102,28 +121,50 @@ def create_profile_card_image(
     created_date_str: str,
     roles: list[tuple[str, tuple[int, int, int, int]]],
     avatar_bytes: Optional[bytes] = None,
-    animated: bool = True
+    animated: bool = True,
+    theme: Optional[CardTheme] = None
 ) -> io.BytesIO:
     """Генерирует сверхчёткую 2X Retina графическую карточку профиля участника."""
     # Разрешение 1200 x 1040 (2x от 600x520) для идеальной чёткости на любых экранах
     w, h = 1200, 1040
+    active_theme = theme or DEFAULT_THEME
     card = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(card)
 
     # 1. Основной фон карточки
-    draw.rounded_rectangle([(0, 0), (w, h)], radius=36, fill=(35, 36, 40, 255), outline=(55, 57, 63, 255), width=3)
+    draw.rounded_rectangle([(0, 0), (w, h)], radius=36, fill=active_theme.card_bg, outline=active_theme.card_border, width=3)
+    if active_theme.card_bg_image_bytes:
+        try:
+            bg_art = Image.open(io.BytesIO(active_theme.card_bg_image_bytes)).convert("RGBA")
+            bg_art = bg_art.resize((w, h), Image.Resampling.LANCZOS)
+            bg_mask = Image.new("L", (w, h), 0)
+            ImageDraw.Draw(bg_mask).rounded_rectangle([(0, 0), (w, h)], radius=36, fill=255)
+            card.paste(bg_art, (0, 0), bg_mask)
+        except Exception:
+            pass
 
-    # 2. Верхний баннер
+    # 2. Верхний баннер (600x110 в 2X = 1200x220)
     banner_h = 220
-    banner = Image.new("RGBA", (w, banner_h), (0, 0, 0, 0))
-    b_draw = ImageDraw.Draw(banner)
-    for y in range(banner_h):
-        ratio = y / banner_h
-        r = int(45 * (1 - ratio) + 24 * ratio)
-        g = int(47 * (1 - ratio) + 25 * ratio)
-        b = int(52 * (1 - ratio) + 28 * ratio)
-        b_draw.line([(0, y), (w, y)], fill=(r, g, b, 255))
-    card.paste(banner, (0, 0), banner)
+    if active_theme.banner_image_bytes:
+        try:
+            b_art = Image.open(io.BytesIO(active_theme.banner_image_bytes)).convert("RGBA")
+            b_art = b_art.resize((w, banner_h), Image.Resampling.LANCZOS)
+            b_mask_full = Image.new("L", (w, h), 0)
+            ImageDraw.Draw(b_mask_full).rounded_rectangle([(0, 0), (w, h)], radius=36, fill=255)
+            b_mask = b_mask_full.crop((0, 0, w, banner_h))
+            card.paste(b_art, (0, 0), b_mask)
+        except Exception:
+            pass
+    else:
+        banner = Image.new("RGBA", (w, banner_h), (0, 0, 0, 0))
+        b_draw = ImageDraw.Draw(banner)
+        for y in range(banner_h):
+            ratio = y / banner_h
+            r = int(active_theme.banner_top[0] * (1 - ratio) + active_theme.banner_bottom[0] * ratio)
+            g = int(active_theme.banner_top[1] * (1 - ratio) + active_theme.banner_bottom[1] * ratio)
+            b = int(active_theme.banner_top[2] * (1 - ratio) + active_theme.banner_bottom[2] * ratio)
+            b_draw.line([(0, y), (w, y)], fill=(r, g, b, 255))
+        card.paste(banner, (0, 0), banner)
 
     # 3. Аватарка: Центр x=140, y=220 (аккуратно на линии стыка баннера), диаметр 160 (r=80)
     av_x, av_y, av_r = 140, 220, 80
@@ -184,7 +225,7 @@ def create_profile_card_image(
     c_ring = ring_box * s
     r_draw.ellipse(
         [(c_ring - (av_r + 6) * s, c_ring - (av_r + 6) * s), (c_ring + (av_r + 6) * s, c_ring + (av_r + 6) * s)],
-        fill=(35, 36, 40, 255)
+        fill=active_theme.card_bg
     )
     r_draw.ellipse(
         [(c_ring - (av_r - 4) * s, c_ring - (av_r - 4) * s), (c_ring + (av_r - 4) * s, c_ring + (av_r - 4) * s)],
@@ -202,7 +243,7 @@ def create_profile_card_image(
     # Темный круг подложки цвета карточки, гарантированно стирающий край авы под точкой
     d_draw.ellipse(
         [(c_dot - dot_bg_r * s, c_dot - dot_bg_r * s), (c_dot + dot_bg_r * s, c_dot + dot_bg_r * s)],
-        fill=(35, 36, 40, 255)
+        fill=active_theme.card_bg
     )
     # Зеленая точка онлайн
     d_draw.ellipse(
@@ -241,7 +282,7 @@ def create_profile_card_image(
     draw.text((60, 404), f"@{handle} • ID: {user_id}", fill=(148, 155, 164, 255), font=font_sub)
 
     # 6. Блок 1: На сервере
-    draw.rounded_rectangle([(60, 454), (580, 588)], radius=24, fill=(30, 31, 34, 255), outline=(48, 50, 56, 255), width=2)
+    draw.rounded_rectangle([(60, 454), (580, 588)], radius=24, fill=active_theme.box_bg, outline=active_theme.box_border, width=2)
     draw_calendar_icon(draw, 90, 478, size=24)
     font_label = get_font(21, bold=True)
     draw.text((124, 478), "НА СЕРВЕРЕ", fill=(148, 155, 164, 255), font=font_label)
@@ -255,16 +296,16 @@ def create_profile_card_image(
     draw.text((90 + days_w + 14, 530), sub_text, fill=(148, 155, 164, 255), font=font_sub_join)
 
     # Блок 2: Сообщения
-    draw.rounded_rectangle([(620, 454), (1140, 588)], radius=24, fill=(30, 31, 34, 255), outline=(48, 50, 56, 255), width=2)
+    draw.rounded_rectangle([(620, 454), (1140, 588)], radius=24, fill=active_theme.box_bg, outline=active_theme.box_border, width=2)
     draw_chat_icon(draw, 650, 478, size=24)
     draw.text((684, 478), "СООБЩЕНИЯ", fill=(148, 155, 164, 255), font=font_label)
     draw.text((650, 520), f"{msg_count} сообщений", fill=(255, 255, 255, 255), font=font_val)
 
     # 7. Блок 3: Время в голосовых (Главная карточка)
-    draw.rounded_rectangle([(60, 614), (1140, 770)], radius=24, fill=(30, 31, 34, 255), outline=(46, 204, 113, 255), width=3)
-    draw_mic_icon(draw, 90, 638, color=(46, 204, 113, 255))
+    draw.rounded_rectangle([(60, 614), (1140, 770)], radius=24, fill=active_theme.box_bg, outline=active_theme.voice_box_border, width=3)
+    draw_mic_icon(draw, 90, 638, color=active_theme.voice_box_border[:3])
     font_voice_title = get_font(23, bold=True)
-    draw.text((124, 638), "ВРЕМЯ В ГОЛОСОВЫХ КАНАЛАХ", fill=(46, 204, 113, 255), font=font_voice_title)
+    draw.text((124, 638), "ВРЕМЯ В ГОЛОСОВЫХ КАНАЛАХ", fill=active_theme.voice_box_border[:3], font=font_voice_title)
 
     if avg_voice_str:
         draw_clock_icon(draw, 640, 642, size=20)
@@ -280,35 +321,35 @@ def create_profile_card_image(
         pt_w = int(draw.textlength(pill_text, font=font_badge))
         pw = pt_w + 64
         px = 1140 - 32 - pw
-        draw.rounded_rectangle([(px, 680), (px + pw, 744)], radius=32, fill=(35, 36, 40, 255), outline=(46, 204, 113, 140), width=2)
+        draw.rounded_rectangle([(px, 680), (px + pw, 744)], radius=32, fill=active_theme.card_bg, outline=(46, 204, 113, 140), width=2)
         draw.ellipse([(px + 18, 706), (px + 32, 720)], fill=(46, 204, 113, 255))
         draw.text((px + 44, 696), pill_text, fill=(46, 204, 113, 255), font=font_badge)
 
     # 8. Блок 4: Победы в Топ-1 месяца
-    draw.rounded_rectangle([(60, 796), (1140, 904)], radius=22, fill=(30, 31, 34, 255), outline=(48, 50, 56, 255), width=2)
+    draw.rounded_rectangle([(60, 796), (1140, 904)], radius=22, fill=active_theme.box_bg, outline=active_theme.box_border, width=2)
     draw_trophy_icon(draw, 90, 836, color=(241, 196, 15, 255))
     font_reward = get_font(25, bold=True)
     draw.text((124, 832), "Победы в Топ-1 месяца:", fill=(241, 196, 15, 255), font=font_reward)
 
     font_pill_reward = get_font(23, bold=False)
     # Пилюля побед в войсе
-    draw.rounded_rectangle([(550, 820), (810, 880)], radius=16, fill=(35, 36, 40, 255), outline=(55, 57, 63, 255), width=2)
+    draw.rounded_rectangle([(550, 820), (810, 880)], radius=16, fill=active_theme.card_bg, outline=active_theme.card_border, width=2)
     draw_mic_icon(draw, 572, 838, color=(148, 155, 164, 255))
     draw.text((606, 834), f"В голосе: {voice_wins}", fill=(219, 222, 225, 255), font=font_pill_reward)
 
     # Пилюля побед в чате
-    draw.rounded_rectangle([(834, 820), (1094, 880)], radius=16, fill=(35, 36, 40, 255), outline=(55, 57, 63, 255), width=2)
+    draw.rounded_rectangle([(834, 820), (1094, 880)], radius=16, fill=active_theme.card_bg, outline=active_theme.card_border, width=2)
     draw_chat_icon(draw, 856, 842, size=20, color=(148, 155, 164, 255))
     draw.text((890, 834), f"В чате: {chat_wins}", fill=(219, 222, 225, 255), font=font_pill_reward)
 
     # 9. Футер
-    draw.line([(60, 940), (1140, 940)], fill=(48, 50, 56, 255), width=2)
+    draw.line([(60, 940), (1140, 940)], fill=active_theme.box_border, width=2)
     font_footer = get_font(21, bold=False)
     draw.text((60, 966), f"Аккаунт создан: {created_date_str} • ID: {user_id}", fill=(115, 118, 128, 255), font=font_footer)
 
     # 10. Верхняя неоновая полоска (статичная или анимированная бегущая волна)
     stripe_h = 10
-    strip = create_accent_strip(w, stripe_h)
+    strip = create_accent_strip(w, stripe_h, colors=active_theme.accent_colors)
 
     # Маска скругления для верхних углов карточки (radius 36)
     tcm_full = Image.new("L", (w, h), 0)
