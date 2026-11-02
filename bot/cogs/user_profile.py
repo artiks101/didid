@@ -1,4 +1,5 @@
 import asyncio
+import io
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from bot.card_generator import create_profile_card_image
 from bot.config import Config
 from bot.utils import LogColors
 
@@ -564,11 +566,24 @@ class UserProfileCog(commands.Cog):
             except Exception:
                 pass
 
-            embed = self._build_me_embed(target, is_self=(target.id == message.author.id))
-            try:
-                await message.author.send(embed=embed)
-            except Exception:
-                await message.channel.send(embed=embed, delete_after=25)
+            target_guild = target.guild if hasattr(target, "guild") and target.guild else message.guild
+            guild_id = target_guild.id if target_guild else 0
+            stats = tracker.get_stats(target.id, guild_id)
+            card_buf = await self._render_profile_card(target, stats)
+
+            if card_buf:
+                file = discord.File(fp=card_buf, filename="profile_card.png")
+                try:
+                    await message.author.send(file=file)
+                except Exception:
+                    file.fp.seek(0)
+                    await message.channel.send(file=file, delete_after=35)
+            else:
+                embed = self._build_me_embed(target, is_self=(target.id == message.author.id))
+                try:
+                    await message.author.send(embed=embed)
+                except Exception:
+                    await message.channel.send(embed=embed, delete_after=25)
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
@@ -667,6 +682,68 @@ class UserProfileCog(commands.Cog):
         )
         return embed
 
+    async def _render_profile_card(self, member: discord.Member, stats: tuple) -> Optional[io.BytesIO]:
+        """Генерирует графическую карточку профиля участника (Pillow) в фоновом потоке."""
+        try:
+            msg_count, voice_secs, current_session, avg_daily = stats
+            guild = getattr(member, "guild", None)
+            guild_id = guild.id if guild else 0
+            voice_wins, chat_wins = tracker.get_user_wins(member.id, guild_id)
+
+            days_on_server = 0
+            join_date_str = "Н/Д"
+            if hasattr(member, "joined_at") and member.joined_at:
+                now = datetime.now(timezone.utc)
+                days_on_server = (now - member.joined_at).days
+                join_date_str = f"с {member.joined_at.strftime('%d.%m.%Y')}"
+
+            voice_str = format_voice_duration(voice_secs)
+            avg_voice_str = f"{format_voice_duration(avg_daily)} / день" if voice_secs > 0 else ""
+
+            current_voice_str = ""
+            in_afk = hasattr(member, "voice") and member.voice and member.voice.channel and is_afk_channel(member.voice.channel)
+            if in_afk:
+                current_voice_str = "В AFK канале"
+            elif current_session is not None and hasattr(member, "voice") and member.voice and member.voice.channel:
+                c_name = getattr(member.voice.channel, "name", "войсе")
+                current_voice_str = f"В #{c_name} ({format_voice_duration(current_session)})"
+
+            created_date_str = member.created_at.strftime("%d.%m.%Y") if hasattr(member, "created_at") and member.created_at else "Н/Д"
+
+            # Роли участника с их цветами (исключая @everyone)
+            roles = []
+            if hasattr(member, "roles"):
+                for r in reversed(member.roles[1:]):
+                    r_col = (r.color.r, r.color.g, r.color.b, 255) if r.color.value != 0 else (150, 150, 150, 255)
+                    roles.append((r.name, r_col))
+
+            avatar_bytes = None
+            if hasattr(member, "display_avatar") and member.display_avatar:
+                try:
+                    avatar_bytes = await member.display_avatar.read()
+                except Exception:
+                    avatar_bytes = None
+
+            return await asyncio.to_thread(
+                create_profile_card_image,
+                display_name=member.display_name,
+                handle=member.name,
+                user_id=member.id,
+                days_on_server=days_on_server,
+                join_date_str=join_date_str,
+                msg_count=msg_count,
+                voice_str=voice_str,
+                avg_voice_str=avg_voice_str,
+                current_voice_str=current_voice_str,
+                voice_wins=voice_wins,
+                chat_wins=chat_wins,
+                created_date_str=created_date_str,
+                roles=roles,
+                avatar_bytes=avatar_bytes
+            )
+        except Exception:
+            return None
+
     @app_commands.command(
         name="me",
         description="Статистика участника: дни на сервере, сообщения, время в войсе"
@@ -683,8 +760,17 @@ class UserProfileCog(commands.Cog):
 
         is_self = (caller is not None and target.id == caller.id)
         try:
-            embed = self._build_me_embed(target, is_self=is_self)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            target_guild = getattr(target, "guild", None) or interaction.guild
+            guild_id = target_guild.id if target_guild else 0
+            stats = tracker.get_stats(target.id, guild_id)
+            card_buf = await self._render_profile_card(target, stats)
+
+            if card_buf:
+                file = discord.File(fp=card_buf, filename="profile_card.png")
+                await interaction.response.send_message(file=file, ephemeral=True)
+            else:
+                embed = self._build_me_embed(target, is_self=is_self)
+                await interaction.response.send_message(embed=embed, ephemeral=True)
         except (discord.NotFound, discord.HTTPException):
             pass
 
@@ -693,15 +779,29 @@ class UserProfileCog(commands.Cog):
         """Текстовая команда !me [@участник]"""
         target = member or ctx.author
         is_self = (target.id == ctx.author.id)
-        embed = self._build_me_embed(target, is_self=is_self)
+        target_guild = getattr(target, "guild", None) or ctx.guild
+        guild_id = target_guild.id if target_guild else 0
+        stats = tracker.get_stats(target.id, guild_id)
+        card_buf = await self._render_profile_card(target, stats)
+
         try:
             await ctx.message.delete()
         except Exception:
             pass
-        try:
-            await ctx.author.send(embed=embed)
-        except Exception:
-            await ctx.send(embed=embed, delete_after=25)
+
+        if card_buf:
+            file = discord.File(fp=card_buf, filename="profile_card.png")
+            try:
+                await ctx.author.send(file=file)
+            except Exception:
+                file.fp.seek(0)
+                await ctx.send(file=file, delete_after=35)
+        else:
+            embed = self._build_me_embed(target, is_self=is_self)
+            try:
+                await ctx.author.send(embed=embed)
+            except Exception:
+                await ctx.send(embed=embed, delete_after=25)
 
 
 async def setup(bot: commands.Bot):
