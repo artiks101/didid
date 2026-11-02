@@ -1,9 +1,17 @@
 import io
+import re
 from pathlib import Path
 from typing import Optional
 from PIL import Image, ImageDraw, ImageFont
 
 FONTS_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
+
+
+def clean_emoji_text(text: str) -> str:
+    """Удаляет символы эмодзи, которые могут отсутствовать в системных шрифтах и вызывать пустые квадраты."""
+    pattern = r"[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\u2b50-\u2b55\u200d\ufe0f]"
+    cleaned = re.sub(pattern, "", text)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
@@ -113,11 +121,40 @@ def create_profile_card_image(
     if avatar_bytes:
         try:
             av_img = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
-            av_img = av_img.resize((av_r * 2, av_r * 2), Image.Resampling.LANCZOS)
-            mask = Image.new("L", (av_r * 2, av_r * 2), 0)
-            m_draw = ImageDraw.Draw(mask)
-            m_draw.ellipse([(0, 0), (av_r * 2, av_r * 2)], fill=255)
-            card.paste(av_img, (av_x - av_r, av_y - av_r), mask)
+
+            # Если у аватарки белый/светлый фон в углах (стикеры/мемы), очищаем наружный фон до прозрачности
+            corners = [
+                (0, 0),
+                (av_img.width - 1, 0),
+                (0, av_img.height - 1),
+                (av_img.width - 1, av_img.height - 1)
+            ]
+            white_corners = sum(1 for pt in corners if sum(av_img.getpixel(pt)[:3]) / 3 > 235)
+            if white_corners >= 3:
+                for pt in corners:
+                    pix = av_img.getpixel(pt)
+                    if sum(pix[:3]) / 3 > 230 and pix[3] > 0:
+                        ImageDraw.floodfill(av_img, pt, (0, 0, 0, 0), thresh=25)
+
+            # Центрированная обрезка до квадрата и увеличение на 5% для полного прилегания без микрополос
+            w_orig, h_orig = av_img.size
+            min_dim = min(w_orig, h_orig)
+            cx, cy = w_orig // 2, h_orig // 2
+            av_sq = av_img.crop((cx - min_dim // 2, cy - min_dim // 2, cx + min_dim // 2, cy + min_dim // 2))
+
+            target_dim = int(av_r * 2 * 1.05)
+            av_scaled = av_sq.resize((target_dim, target_dim), Image.Resampling.LANCZOS)
+            offset = (target_dim - av_r * 2) // 2
+            av_final = av_scaled.crop((offset, offset, offset + av_r * 2, offset + av_r * 2))
+
+            # 4x суперсэмплированная гладкая круглая маска
+            s = 4
+            mask_hi = Image.new("L", (av_r * 2 * s, av_r * 2 * s), 0)
+            m_draw = ImageDraw.Draw(mask_hi)
+            m_draw.ellipse([(0, 0), (av_r * 2 * s - 1, av_r * 2 * s - 1)], fill=255)
+            mask = mask_hi.resize((av_r * 2, av_r * 2), Image.Resampling.LANCZOS)
+
+            card.paste(av_final, (av_x - av_r, av_y - av_r), mask)
             rendered_avatar = True
         except Exception:
             rendered_avatar = False
@@ -128,12 +165,42 @@ def create_profile_card_image(
         draw.ellipse([(av_x + 12, av_y - 14), (av_x + 24, av_y)], fill=(30, 31, 34, 255))
         draw.arc([(av_x - 32, av_y + 4), (av_x + 32, av_y + 40)], 0, 180, fill=(30, 31, 34, 255), width=8)
 
-    # Рамка аватарки в цвет карточки
-    draw.ellipse([(av_x - av_r, av_y - av_r), (av_x + av_r, av_y + av_r)], outline=(35, 36, 40, 255), width=10)
+    # Защитная сглаженная рамка вокруг аватарки в цвет карточки
+    # Внутренний радиус перекрывает микрокрай аватарки, исключая любые белые полосы
+    s = 4
+    ring_box = av_r + 16
+    ring_hi = Image.new("RGBA", (ring_box * 2 * s, ring_box * 2 * s), (0, 0, 0, 0))
+    r_draw = ImageDraw.Draw(ring_hi)
+    c_ring = ring_box * s
+    r_draw.ellipse(
+        [(c_ring - (av_r + 6) * s, c_ring - (av_r + 6) * s), (c_ring + (av_r + 6) * s, c_ring + (av_r + 6) * s)],
+        fill=(35, 36, 40, 255)
+    )
+    r_draw.ellipse(
+        [(c_ring - (av_r - 4) * s, c_ring - (av_r - 4) * s), (c_ring + (av_r - 4) * s, c_ring + (av_r - 4) * s)],
+        fill=(0, 0, 0, 0)
+    )
+    ring_img = ring_hi.resize((ring_box * 2, ring_box * 2), Image.Resampling.LANCZOS)
+    card.paste(ring_img, (av_x - ring_box, av_y - ring_box), ring_img)
 
-    # Точка онлайн-статуса
+    # Точка онлайн-статуса со сглаженной подложкой
     dot_x, dot_y, dot_r = av_x + 54, av_y + 54, 20
-    draw.ellipse([(dot_x - dot_r, dot_y - dot_r), (dot_x + dot_r, dot_y + dot_r)], fill=(46, 204, 113, 255), outline=(35, 36, 40, 255), width=6)
+    dot_bg_r = dot_r + 7
+    d_hi = Image.new("RGBA", (dot_bg_r * 2 * s, dot_bg_r * 2 * s), (0, 0, 0, 0))
+    d_draw = ImageDraw.Draw(d_hi)
+    c_dot = dot_bg_r * s
+    # Темный круг подложки цвета карточки, гарантированно стирающий край авы под точкой
+    d_draw.ellipse(
+        [(c_dot - dot_bg_r * s, c_dot - dot_bg_r * s), (c_dot + dot_bg_r * s, c_dot + dot_bg_r * s)],
+        fill=(35, 36, 40, 255)
+    )
+    # Зеленая точка онлайн
+    d_draw.ellipse(
+        [(c_dot - dot_r * s, c_dot - dot_r * s), (c_dot + dot_r * s, c_dot + dot_r * s)],
+        fill=(46, 204, 113, 255)
+    )
+    dot_img = d_hi.resize((dot_bg_r * 2, dot_bg_r * 2), Image.Resampling.LANCZOS)
+    card.paste(dot_img, (dot_x - dot_bg_r, dot_y - dot_bg_r), dot_img)
 
     # 4. Бейджи ролей (в правом верхнем углу)
     font_badge = get_font(22, bold=True)
@@ -193,8 +260,8 @@ def create_profile_card_image(
     draw.text((90, 686), voice_str, fill=(255, 255, 255, 255), font=font_voice_val)
 
     if current_voice_str:
-        # Очищаем спецсимволы в названии текущего войса для аккуратного отображения
-        c_clean = current_voice_str.replace("💖", "").replace("🔊", "").strip()
+        # Очищаем спецсимволы и неподдерживаемые эмодзи в названии текущего войса для аккуратного отображения
+        c_clean = clean_emoji_text(current_voice_str)
         pill_text = c_clean if len(c_clean) <= 28 else c_clean[:27] + "…"
         pt_w = int(draw.textlength(pill_text, font=font_badge))
         pw = pt_w + 64
