@@ -19,7 +19,6 @@ MEDALS = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8
 
 _AVATAR_CACHE: dict[int, tuple[bytes, float]] = {}
 _TOP_CARD_CACHE: dict[tuple[int, str, str], tuple[bytes, float]] = {}
-_BUSY_MESSAGES: set[int] = set()
 
 
 def format_voice_duration_short(seconds: float) -> str:
@@ -62,10 +61,10 @@ async def build_voice_top_card(guild: Optional[discord.Guild], period: str = "we
     cache_key = (guild_id, "voice", period)
     ext = "gif" if animated else "png"
 
-    # Быстрый возврат из кэша (до 60 секунд), чтобы мгновенно отвечать при кликах кнопок
+    # Быстрый возврат из кэша (до 15 минут), чтобы мгновенно отвечать при кликах кнопок
     if cache_key in _TOP_CARD_CACHE:
         cached_bytes, cached_at = _TOP_CARD_CACHE[cache_key]
-        if now - cached_at < 60:
+        if now - cached_at < 900:
             nonce = int(now * 1000)
             return discord.File(io.BytesIO(cached_bytes), filename=f"voice_top_{period}_{nonce}.{ext}")
 
@@ -125,10 +124,10 @@ async def build_messages_top_card(guild: Optional[discord.Guild], period: str = 
     cache_key = (guild_id, "msgs", period)
     ext = "gif" if animated else "png"
 
-    # Быстрый возврат из кэша (до 60 секунд)
+    # Быстрый возврат из кэша (до 15 минут)
     if cache_key in _TOP_CARD_CACHE:
         cached_bytes, cached_at = _TOP_CARD_CACHE[cache_key]
-        if now - cached_at < 60:
+        if now - cached_at < 900:
             nonce = int(now * 1000)
             return discord.File(io.BytesIO(cached_bytes), filename=f"msgs_top_{period}_{nonce}.{ext}")
 
@@ -307,18 +306,29 @@ class VoiceTopView(discord.ui.View):
         self.btn_all.style = discord.ButtonStyle.primary if current_period == "all" else discord.ButtonStyle.secondary
 
     async def _handle_period_change(self, interaction: discord.Interaction, period: str):
-        # Обязательно подтверждаем получение взаимодействия сразу
+        # 1. Быстрый путь: если карточка уже в кэше — мгновенный ответ через edit_message (без defer)
+        guild_id = interaction.guild.id if interaction.guild else 0
+        cache_key = (guild_id, "voice", period)
+        now = time.time()
+        cached = _TOP_CARD_CACHE.get(cache_key)
+
+        if cached and (now - cached[1] < 900) and not interaction.response.is_done():
+            nonce = int(now * 1000)
+            card_file = discord.File(io.BytesIO(cached[0]), filename=f"voice_top_{period}_{nonce}.gif")
+            view = VoiceTopView(current_period=period)
+            try:
+                await interaction.response.edit_message(attachments=[card_file], embed=None, view=view)
+                return
+            except Exception as e:
+                logger.warning(f"Ошибка мгновенного ответа из кэша (голос): {e}")
+
+        # 2. Если карточки нет в кэше — подтверждаем ожидание и генерируем
         if not interaction.response.is_done():
             try:
                 await interaction.response.defer()
             except Exception:
                 pass
 
-        msg_id = interaction.message.id if interaction.message else 0
-        if msg_id in _BUSY_MESSAGES:
-            return
-
-        _BUSY_MESSAGES.add(msg_id)
         try:
             card_file = await build_voice_top_card(interaction.guild, period=period, animated=True)
             view = VoiceTopView(current_period=period)
@@ -331,8 +341,6 @@ class VoiceTopView(discord.ui.View):
             logger.warning(f"Ошибка при смене периода голосового топа: {e}")
         except Exception as e:
             logger.exception(f"Исключение при обновлении голосового топа: {e}")
-        finally:
-            _BUSY_MESSAGES.discard(msg_id)
 
     @discord.ui.button(label="📅 За неделю", style=discord.ButtonStyle.primary, custom_id="voicetop_btn_week")
     async def btn_week(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -358,17 +366,27 @@ class MessagesTopView(discord.ui.View):
         self.btn_all.style = discord.ButtonStyle.primary if current_period == "all" else discord.ButtonStyle.secondary
 
     async def _handle_period_change(self, interaction: discord.Interaction, period: str):
+        guild_id = interaction.guild.id if interaction.guild else 0
+        cache_key = (guild_id, "msgs", period)
+        now = time.time()
+        cached = _TOP_CARD_CACHE.get(cache_key)
+
+        if cached and (now - cached[1] < 900) and not interaction.response.is_done():
+            nonce = int(now * 1000)
+            card_file = discord.File(io.BytesIO(cached[0]), filename=f"msgs_top_{period}_{nonce}.gif")
+            view = MessagesTopView(current_period=period)
+            try:
+                await interaction.response.edit_message(attachments=[card_file], embed=None, view=view)
+                return
+            except Exception as e:
+                logger.warning(f"Ошибка мгновенного ответа из кэша (сообщения): {e}")
+
         if not interaction.response.is_done():
             try:
                 await interaction.response.defer()
             except Exception:
                 pass
 
-        msg_id = interaction.message.id if interaction.message else 0
-        if msg_id in _BUSY_MESSAGES:
-            return
-
-        _BUSY_MESSAGES.add(msg_id)
         try:
             card_file = await build_messages_top_card(interaction.guild, period=period, animated=True)
             view = MessagesTopView(current_period=period)
@@ -381,8 +399,6 @@ class MessagesTopView(discord.ui.View):
             logger.warning(f"Ошибка при смене периода топа сообщений: {e}")
         except Exception as e:
             logger.exception(f"Исключение при обновлении топа сообщений: {e}")
-        finally:
-            _BUSY_MESSAGES.discard(msg_id)
 
     @discord.ui.button(label="📅 За неделю", style=discord.ButtonStyle.primary, custom_id="msgstop_btn_week")
     async def btn_week(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -577,7 +593,19 @@ class LeaderboardsCog(commands.Cog):
                 msgs_msg.id if msgs_msg else None,
                 rules_msg.id if rules_msg else None
             )
+
+            # Фоновый прогрев остальных периодов для мгновенного отклика кнопок
+            asyncio.create_task(self.precache_all_periods(guild))
             return True
+
+    async def precache_all_periods(self, guild: discord.Guild):
+        """В фоне генерирует остальные периоды в RAM, гарантируя мгновенный отклик при кликах."""
+        for p in ("month", "all"):
+            try:
+                await build_voice_top_card(guild, period=p, animated=True)
+                await build_messages_top_card(guild, period=p, animated=True)
+            except Exception as e:
+                logger.warning(f"Ошибка предкэширования периода {p}: {e}")
 
     @tasks.loop(minutes=15)
     async def auto_refresh_tops(self):
@@ -789,6 +817,8 @@ class LeaderboardsCog(commands.Cog):
         # Регистрируем персистентные кнопки для мгновенной обработки после перезапуска
         self.bot.add_view(VoiceTopView("week"))
         self.bot.add_view(MessagesTopView("week"))
+        for guild in self.bot.guilds:
+            asyncio.create_task(self.precache_all_periods(guild))
 
     @app_commands.command(
         name="updatetop",
