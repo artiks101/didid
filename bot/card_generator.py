@@ -683,8 +683,8 @@ def create_leaderboard_card_image(
         buffer.seek(0)
         return buffer
 
-    # Генерация 16-кадрового плавного циклического GIF
-    num_frames = 16
+    # Генерация 8-кадрового плавного циклического GIF (быстрый рендер ~0.35s для моментального отклика)
+    num_frames = 8
     frames = []
     bg_color = (49, 51, 56)
     for i in range(num_frames):
@@ -705,7 +705,7 @@ def create_leaderboard_card_image(
         format="GIF",
         save_all=True,
         append_images=p_frames[1:],
-        duration=65,
+        duration=90,
         loop=0
     )
     buffer.seek(0)

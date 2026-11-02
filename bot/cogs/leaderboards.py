@@ -17,6 +17,8 @@ logger = logging.getLogger("bot.cogs.leaderboards")
 MEDALS = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
 _AVATAR_CACHE: dict[int, tuple[bytes, float]] = {}
+_TOP_CARD_CACHE: dict[tuple[int, str, str], tuple[bytes, float]] = {}
+_BUSY_MESSAGES: set[int] = set()
 
 
 def format_voice_duration_short(seconds: float) -> str:
@@ -53,8 +55,19 @@ async def _fetch_member_avatar_bytes(member: Optional[discord.Member]) -> Option
 
 
 async def build_voice_top_card(guild: Optional[discord.Guild], period: str = "week", animated: bool = True) -> Optional[discord.File]:
-    """Генерирует графическую карточку голосового топа (PNG или анимированный GIF)."""
+    """Генерирует графическую карточку голосового топа (PNG или анимированный GIF с кэшированием)."""
     guild_id = guild.id if guild else 0
+    now = time.time()
+    cache_key = (guild_id, "voice", period)
+    ext = "gif" if animated else "png"
+
+    # Быстрый возврат из кэша (до 60 секунд), чтобы мгновенно отвечать при кликах кнопок
+    if cache_key in _TOP_CARD_CACHE:
+        cached_bytes, cached_at = _TOP_CARD_CACHE[cache_key]
+        if now - cached_at < 60:
+            nonce = int(now * 1000)
+            return discord.File(io.BytesIO(cached_bytes), filename=f"voice_top_{period}_{nonce}.{ext}")
+
     top_data = tracker.get_top_voice(guild_id, period=period, limit=10)
     period_labels = {
         "week": "За неделю",
@@ -95,16 +108,29 @@ async def build_voice_top_card(guild: Optional[discord.Guild], period: str = "we
             is_voice=True,
             animated=animated
         )
-        ext = "gif" if animated else "png"
-        return discord.File(buf, filename=f"voice_top.{ext}")
+        card_bytes = buf.getvalue()
+        _TOP_CARD_CACHE[cache_key] = (card_bytes, now)
+        nonce = int(now * 1000)
+        return discord.File(io.BytesIO(card_bytes), filename=f"voice_top_{period}_{nonce}.{ext}")
     except Exception as e:
         logger.error(f"Ошибка генерации карточки голосового топа: {e}", exc_info=True)
         return None
 
 
 async def build_messages_top_card(guild: Optional[discord.Guild], period: str = "week", animated: bool = True) -> Optional[discord.File]:
-    """Генерирует графическую карточку топа по сообщениям (PNG или анимированный GIF)."""
+    """Генерирует графическую карточку топа по сообщениям (PNG или анимированный GIF с кэшированием)."""
     guild_id = guild.id if guild else 0
+    now = time.time()
+    cache_key = (guild_id, "msgs", period)
+    ext = "gif" if animated else "png"
+
+    # Быстрый возврат из кэша (до 60 секунд)
+    if cache_key in _TOP_CARD_CACHE:
+        cached_bytes, cached_at = _TOP_CARD_CACHE[cache_key]
+        if now - cached_at < 60:
+            nonce = int(now * 1000)
+            return discord.File(io.BytesIO(cached_bytes), filename=f"msgs_top_{period}_{nonce}.{ext}")
+
     top_data = tracker.get_top_messages(guild_id, period=period, limit=10)
     period_labels = {
         "week": "За неделю",
@@ -145,8 +171,10 @@ async def build_messages_top_card(guild: Optional[discord.Guild], period: str = 
             is_voice=False,
             animated=animated
         )
-        ext = "gif" if animated else "png"
-        return discord.File(buf, filename=f"msgs_top.{ext}")
+        card_bytes = buf.getvalue()
+        _TOP_CARD_CACHE[cache_key] = (card_bytes, now)
+        nonce = int(now * 1000)
+        return discord.File(io.BytesIO(card_bytes), filename=f"msgs_top_{period}_{nonce}.{ext}")
     except Exception as e:
         logger.error(f"Ошибка генерации карточки топа сообщений: {e}", exc_info=True)
         return None
@@ -272,13 +300,25 @@ class VoiceTopView(discord.ui.View):
 
     def __init__(self, current_period: str = "week"):
         super().__init__(timeout=None)
+        self.current_period = current_period
         self.btn_week.style = discord.ButtonStyle.primary if current_period == "week" else discord.ButtonStyle.secondary
         self.btn_month.style = discord.ButtonStyle.primary if current_period == "month" else discord.ButtonStyle.secondary
         self.btn_all.style = discord.ButtonStyle.primary if current_period == "all" else discord.ButtonStyle.secondary
 
     async def _handle_period_change(self, interaction: discord.Interaction, period: str):
+        # Обязательно подтверждаем получение взаимодействия сразу
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
+
+        msg_id = interaction.message.id if interaction.message else 0
+        if msg_id in _BUSY_MESSAGES:
+            return
+
+        _BUSY_MESSAGES.add(msg_id)
         try:
-            await interaction.response.defer()
             card_file = await build_voice_top_card(interaction.guild, period=period, animated=True)
             view = VoiceTopView(current_period=period)
             if card_file:
@@ -286,10 +326,12 @@ class VoiceTopView(discord.ui.View):
             else:
                 embed = await asyncio.to_thread(build_voice_top_embed, interaction.guild, period)
                 await interaction.edit_original_response(embed=embed, view=view)
-        except (discord.NotFound, discord.HTTPException):
-            pass
-        except Exception as e:
+        except (discord.NotFound, discord.HTTPException) as e:
             logger.warning(f"Ошибка при смене периода голосового топа: {e}")
+        except Exception as e:
+            logger.exception(f"Исключение при обновлении голосового топа: {e}")
+        finally:
+            _BUSY_MESSAGES.discard(msg_id)
 
     @discord.ui.button(label="📅 За неделю", style=discord.ButtonStyle.primary, custom_id="voicetop_btn_week")
     async def btn_week(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -309,13 +351,24 @@ class MessagesTopView(discord.ui.View):
 
     def __init__(self, current_period: str = "week"):
         super().__init__(timeout=None)
+        self.current_period = current_period
         self.btn_week.style = discord.ButtonStyle.primary if current_period == "week" else discord.ButtonStyle.secondary
         self.btn_month.style = discord.ButtonStyle.primary if current_period == "month" else discord.ButtonStyle.secondary
         self.btn_all.style = discord.ButtonStyle.primary if current_period == "all" else discord.ButtonStyle.secondary
 
     async def _handle_period_change(self, interaction: discord.Interaction, period: str):
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
+
+        msg_id = interaction.message.id if interaction.message else 0
+        if msg_id in _BUSY_MESSAGES:
+            return
+
+        _BUSY_MESSAGES.add(msg_id)
         try:
-            await interaction.response.defer()
             card_file = await build_messages_top_card(interaction.guild, period=period, animated=True)
             view = MessagesTopView(current_period=period)
             if card_file:
@@ -323,10 +376,12 @@ class MessagesTopView(discord.ui.View):
             else:
                 embed = await asyncio.to_thread(build_messages_top_embed, interaction.guild, period)
                 await interaction.edit_original_response(embed=embed, view=view)
-        except (discord.NotFound, discord.HTTPException):
-            pass
-        except Exception as e:
+        except (discord.NotFound, discord.HTTPException) as e:
             logger.warning(f"Ошибка при смене периода топа сообщений: {e}")
+        except Exception as e:
+            logger.exception(f"Исключение при обновлении топа сообщений: {e}")
+        finally:
+            _BUSY_MESSAGES.discard(msg_id)
 
     @discord.ui.button(label="📅 За неделю", style=discord.ButtonStyle.primary, custom_id="msgstop_btn_week")
     async def btn_week(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -357,6 +412,9 @@ class LeaderboardsCog(commands.Cog):
     async def update_guild_leaderboard(self, guild: discord.Guild) -> bool:
         """Обновляет или отправляет карточки топов и правил в настроенный канал, очищая дубликаты."""
         async with self._lock:
+            # Сбрасываем кэш сгенерированных карточек для отображения свежих данных
+            _TOP_CARD_CACHE.clear()
+
             channel = self.bot.get_channel(Config.TOP_CHANNEL_ID)
             if not isinstance(channel, discord.TextChannel):
                 return False
