@@ -150,21 +150,33 @@ class VoiceTopView(discord.ui.View):
 
     @discord.ui.button(label="📅 За неделю", style=discord.ButtonStyle.primary, custom_id="voicetop_btn_week")
     async def btn_week(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = build_voice_top_embed(interaction.guild, period="week")
-        view = VoiceTopView(current_period="week")
-        await interaction.response.edit_message(embed=embed, view=view)
+        try:
+            await interaction.response.defer()
+            embed = await asyncio.to_thread(build_voice_top_embed, interaction.guild, "week")
+            view = VoiceTopView(current_period="week")
+            await interaction.edit_original_response(embed=embed, view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
     @discord.ui.button(label="🗓️ За месяц", style=discord.ButtonStyle.secondary, custom_id="voicetop_btn_month")
     async def btn_month(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = build_voice_top_embed(interaction.guild, period="month")
-        view = VoiceTopView(current_period="month")
-        await interaction.response.edit_message(embed=embed, view=view)
+        try:
+            await interaction.response.defer()
+            embed = await asyncio.to_thread(build_voice_top_embed, interaction.guild, "month")
+            view = VoiceTopView(current_period="month")
+            await interaction.edit_original_response(embed=embed, view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
     @discord.ui.button(label="🏆 За всё время", style=discord.ButtonStyle.secondary, custom_id="voicetop_btn_all")
     async def btn_all(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = build_voice_top_embed(interaction.guild, period="all")
-        view = VoiceTopView(current_period="all")
-        await interaction.response.edit_message(embed=embed, view=view)
+        try:
+            await interaction.response.defer()
+            embed = await asyncio.to_thread(build_voice_top_embed, interaction.guild, "all")
+            view = VoiceTopView(current_period="all")
+            await interaction.edit_original_response(embed=embed, view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
 
 class MessagesTopView(discord.ui.View):
@@ -187,21 +199,33 @@ class MessagesTopView(discord.ui.View):
 
     @discord.ui.button(label="📅 За неделю", style=discord.ButtonStyle.primary, custom_id="msgstop_btn_week")
     async def btn_week(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = build_messages_top_embed(interaction.guild, period="week")
-        view = MessagesTopView(current_period="week")
-        await interaction.response.edit_message(embed=embed, view=view)
+        try:
+            await interaction.response.defer()
+            embed = await asyncio.to_thread(build_messages_top_embed, interaction.guild, "week")
+            view = MessagesTopView(current_period="week")
+            await interaction.edit_original_response(embed=embed, view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
     @discord.ui.button(label="🗓️ За месяц", style=discord.ButtonStyle.secondary, custom_id="msgstop_btn_month")
     async def btn_month(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = build_messages_top_embed(interaction.guild, period="month")
-        view = MessagesTopView(current_period="month")
-        await interaction.response.edit_message(embed=embed, view=view)
+        try:
+            await interaction.response.defer()
+            embed = await asyncio.to_thread(build_messages_top_embed, interaction.guild, "month")
+            view = MessagesTopView(current_period="month")
+            await interaction.edit_original_response(embed=embed, view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
     @discord.ui.button(label="🏆 За всё время", style=discord.ButtonStyle.secondary, custom_id="msgstop_btn_all")
     async def btn_all(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = build_messages_top_embed(interaction.guild, period="all")
-        view = MessagesTopView(current_period="all")
-        await interaction.response.edit_message(embed=embed, view=view)
+        try:
+            await interaction.response.defer()
+            embed = await asyncio.to_thread(build_messages_top_embed, interaction.guild, "all")
+            view = MessagesTopView(current_period="all")
+            await interaction.edit_original_response(embed=embed, view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
 
 class LeaderboardsCog(commands.Cog):

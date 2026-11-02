@@ -90,7 +90,10 @@ class PersistentMessageCache:
 
     def _init_db(self):
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA synchronous = NORMAL")
+                conn.execute("PRAGMA busy_timeout = 5000")
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS messages (
                         id INTEGER PRIMARY KEY,
@@ -129,7 +132,8 @@ class PersistentMessageCache:
         attachments_json = json.dumps([a.url for a in message.attachments])
         created_ts = message.created_at.timestamp() if message.created_at else time.time()
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+                conn.execute("PRAGMA busy_timeout = 5000")
                 conn.execute(
                     "INSERT OR REPLACE INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (message.id, message.channel.id, message.author.id, str(message.author), message.content or "", attachments_json, created_ts)

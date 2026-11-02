@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -58,7 +59,10 @@ class UserActivityTracker:
 
     def _init_db(self):
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA synchronous = NORMAL")
+                conn.execute("PRAGMA busy_timeout = 5000")
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS user_activity (
                         user_id INTEGER,
@@ -179,15 +183,39 @@ class UserActivityTracker:
         self._active_voice[user_id] = (guild_id, now)
 
     def flush_all(self):
-        """Регулярно сохраняет накопленное голосовое время всех активных участников в SQLite."""
+        """Регулярно сохраняет накопленное голосовое время всех активных участников в SQLite единой транзакцией."""
         if not self._active_voice:
             return
         now = time.time()
+        updates = []
         for user_id, (guild_id, last_time) in list(self._active_voice.items()):
             elapsed = now - last_time
             if elapsed > 0:
-                self.add_voice_seconds(user_id, guild_id, elapsed)
+                updates.append((user_id, guild_id, elapsed))
                 self._active_voice[user_id] = (guild_id, now)
+
+        if not updates:
+            return
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        try:
+            with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+                conn.execute("PRAGMA busy_timeout = 5000")
+                cursor = conn.cursor()
+                for user_id, guild_id, seconds in updates:
+                    cursor.execute("""
+                        INSERT INTO user_activity (user_id, guild_id, message_count, voice_seconds)
+                        VALUES (?, ?, 0, ?)
+                        ON CONFLICT(user_id, guild_id) DO UPDATE SET voice_seconds = voice_seconds + ?
+                    """, (user_id, guild_id, seconds, seconds))
+                    cursor.execute("""
+                        INSERT INTO activity_daily (user_id, guild_id, date, message_count, voice_seconds)
+                        VALUES (?, ?, ?, 0, ?)
+                        ON CONFLICT(user_id, guild_id, date) DO UPDATE SET voice_seconds = voice_seconds + ?
+                    """, (user_id, guild_id, today, seconds, seconds))
+                conn.commit()
+        except Exception:
+            pass
 
     def delete_user_data(self, user_id: int, guild_id: Optional[int] = None):
         """Полностью удаляет данные активности и кэшированных сообщений участника."""
@@ -456,11 +484,11 @@ class UserProfileCog(commands.Cog):
         self.sync_voice_activity.cancel()
         tracker.flush_all()
 
-    @tasks.loop(seconds=15)
+    @tasks.loop(seconds=30)
     async def sync_voice_activity(self):
-        """Каждые 15 секунд сбрасывает голосовое время в SQLite, предотвращая потерю данных при перезагрузках."""
+        """Каждые 30 секунд сбрасывает голосовое время в SQLite в отдельном потоке."""
         try:
-            tracker.flush_all()
+            await asyncio.to_thread(tracker.flush_all)
         except Exception:
             pass
 
@@ -623,8 +651,11 @@ class UserProfileCog(commands.Cog):
             target = interaction.user
 
         is_self = (caller is not None and target.id == caller.id)
-        embed = self._build_me_embed(target, is_self=is_self)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        try:
+            embed = self._build_me_embed(target, is_self=is_self)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
     @commands.command(name="me")
     async def me_prefix(self, ctx: commands.Context, *, member: Optional[discord.Member] = None):

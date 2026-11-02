@@ -109,11 +109,17 @@ class StatusCog(commands.Cog):
     async def status_slash(self, interaction: discord.Interaction):
         """Слэш-команда /status (видна только разрешенным пользователям)"""
         if interaction.user.id not in ALLOWED_STATUS_USERS:
-            await interaction.response.send_message("❌ У вас нет доступа к этой команде.", ephemeral=True)
+            try:
+                await interaction.response.send_message("❌ У вас нет доступа к этой команде.", ephemeral=True)
+            except (discord.NotFound, discord.HTTPException):
+                pass
             return
 
-        embed = self._build_status_embed()
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        try:
+            embed = self._build_status_embed()
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
     @commands.command(name="status")
     async def status_prefix(self, ctx: commands.Context):
