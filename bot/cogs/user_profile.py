@@ -48,6 +48,58 @@ def format_voice_duration(seconds: float) -> str:
     return " ".join(parts)
 
 
+RU_MONTHS = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря"
+]
+
+
+def format_relative_time_ru(joined_at: datetime, now: Optional[datetime] = None) -> str:
+    """Форматирует относительное время регистрации/входа на сервер на русском языке (аналог <t:ts:R>)."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    delta_days = (now - joined_at).days
+    if delta_days <= 0:
+        return "сегодня"
+    elif delta_days == 1:
+        return "вчера"
+    elif delta_days < 30:
+        d = delta_days
+        if 11 <= (d % 100) <= 14:
+            suf = "дней"
+        elif d % 10 == 1:
+            suf = "день"
+        elif 2 <= (d % 10) <= 4:
+            suf = "дня"
+        else:
+            suf = "дней"
+        return f"{d} {suf} назад"
+    elif delta_days < 365:
+        months = max(1, round(delta_days / 30.4375))
+        if 11 <= (months % 100) <= 14:
+            suf = "месяцев"
+        elif months % 10 == 1:
+            suf = "месяц"
+        elif 2 <= (months % 10) <= 4:
+            suf = "месяца"
+        else:
+            suf = "месяцев"
+        return f"{months} {suf} назад"
+    else:
+        years = round(delta_days / 365.25)
+        if years < 1:
+            years = 1
+        if 11 <= (years % 100) <= 14:
+            suf = "лет"
+        elif years % 10 == 1:
+            suf = "год"
+        elif 2 <= (years % 10) <= 4:
+            suf = "года"
+        else:
+            suf = "лет"
+        return f"{years} {suf} назад"
+
+
 class UserActivityTracker:
     """Хранилище активности участников (сообщения и голосовое время) в SQLite."""
 
@@ -695,7 +747,11 @@ class UserProfileCog(commands.Cog):
             if hasattr(member, "joined_at") and member.joined_at:
                 now = datetime.now(timezone.utc)
                 days_on_server = (now - member.joined_at).days
-                join_date_str = f"с {member.joined_at.strftime('%d.%m.%Y')}"
+                rel_time = format_relative_time_ru(member.joined_at, now)
+                m_idx = member.joined_at.month - 1
+                month_name = RU_MONTHS[m_idx] if 0 <= m_idx < 12 else ""
+                date_part = f"с {member.joined_at.day} {month_name} {member.joined_at.year} г." if month_name else f"с {member.joined_at.strftime('%d.%m.%Y')}"
+                join_date_str = f"{date_part} • {rel_time}"
 
             voice_str = format_voice_duration(voice_secs)
             avg_voice_str = f"{format_voice_duration(avg_daily)} / день" if voice_secs > 0 else ""

@@ -238,7 +238,11 @@ def create_profile_card_image(
     font_val = get_font(33, bold=True)
     draw.text((90, 520), f"{days_on_server} дн.", fill=(255, 255, 255, 255), font=font_val)
     days_w = int(draw.textlength(f"{days_on_server} дн.", font=font_val))
-    draw.text((90 + days_w + 14, 528), f"({join_date_str})", fill=(148, 155, 164, 255), font=font_sub)
+    font_sub_join = get_font(18, bold=False)
+    sub_text = f"({join_date_str})"
+    while draw.textlength(sub_text, font=font_sub_join) + days_w + 104 > 565 and font_sub_join.size > 13:
+        font_sub_join = get_font(font_sub_join.size - 1, bold=False)
+    draw.text((90 + days_w + 14, 530), sub_text, fill=(148, 155, 164, 255), font=font_sub_join)
 
     # Блок 2: Сообщения
     draw.rounded_rectangle([(620, 454), (1140, 588)], radius=24, fill=(30, 31, 34, 255), outline=(48, 50, 56, 255), width=2)
