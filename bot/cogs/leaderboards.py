@@ -1,4 +1,5 @@
 import asyncio
+import time
 from datetime import timedelta
 import logging
 from typing import Optional
@@ -9,10 +10,146 @@ from discord.ext import commands, tasks
 from bot.config import Config
 from bot.utils import LogColors
 from bot.cogs.user_profile import tracker, format_voice_duration
+from bot.card_generator import create_leaderboard_card_image
 
 logger = logging.getLogger("bot.cogs.leaderboards")
 
 MEDALS = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+_AVATAR_CACHE: dict[int, tuple[bytes, float]] = {}
+
+
+def format_voice_duration_short(seconds: float) -> str:
+    """Компактное форматирование времени для аккуратного размещения в пилюлях карточки топа."""
+    secs = int(seconds)
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, s = divmod(rem, 60)
+    if days > 0:
+        return f"{days} дн. {hours} ч." if hours > 0 else f"{days} дн."
+    if hours > 0:
+        return f"{hours} ч. {mins} мин." if mins > 0 else f"{hours} ч."
+    if mins > 0:
+        return f"{mins} мин. {s} с." if s > 0 else f"{mins} мин."
+    return f"{s} с."
+
+
+async def _fetch_member_avatar_bytes(member: Optional[discord.Member]) -> Optional[bytes]:
+    """Асинхронно скачивает аватарку участника с кэшированием в памяти на 15 минут."""
+    if not member or not getattr(member, "display_avatar", None):
+        return None
+    user_id = member.id
+    now = time.time()
+    if user_id in _AVATAR_CACHE:
+        b_data, cached_at = _AVATAR_CACHE[user_id]
+        if now - cached_at < 900:
+            return b_data
+    try:
+        data = await asyncio.wait_for(member.display_avatar.read(), timeout=2.5)
+        _AVATAR_CACHE[user_id] = (data, now)
+        return data
+    except Exception:
+        return None
+
+
+async def build_voice_top_card(guild: Optional[discord.Guild], period: str = "week", animated: bool = True) -> Optional[discord.File]:
+    """Генерирует графическую карточку голосового топа (PNG или анимированный GIF)."""
+    guild_id = guild.id if guild else 0
+    top_data = tracker.get_top_voice(guild_id, period=period, limit=10)
+    period_labels = {
+        "week": "За неделю",
+        "month": "За месяц",
+        "all": "За всё время",
+    }
+    period_title = period_labels.get(period, "За неделю")
+
+    entries = []
+    fetch_tasks = []
+    members = []
+    for user_id, secs in top_data:
+        m = guild.get_member(user_id) if guild else None
+        members.append((user_id, m, secs))
+        fetch_tasks.append(_fetch_member_avatar_bytes(m))
+
+    avatar_results = await asyncio.gather(*fetch_tasks, return_exceptions=True) if fetch_tasks else []
+
+    for idx, (user_id, m, secs) in enumerate(members):
+        av_bytes = avatar_results[idx] if idx < len(avatar_results) and isinstance(avatar_results[idx], (bytes, bytearray)) else None
+        name = m.display_name if m else f"Участник {user_id}"
+        score_str = format_voice_duration_short(secs)
+        entries.append({
+            "rank": idx + 1,
+            "name": name,
+            "score_str": score_str,
+            "avatar_bytes": av_bytes,
+            "is_empty": False
+        })
+
+    try:
+        buf = await asyncio.to_thread(
+            create_leaderboard_card_image,
+            title="ТОП УЧАСТНИКОВ • СЕРВЕР",
+            subtitle="Голосовые каналы",
+            period_label=period_title,
+            entries=entries,
+            is_voice=True,
+            animated=animated
+        )
+        ext = "gif" if animated else "png"
+        return discord.File(buf, filename=f"voice_top.{ext}")
+    except Exception as e:
+        logger.error(f"Ошибка генерации карточки голосового топа: {e}", exc_info=True)
+        return None
+
+
+async def build_messages_top_card(guild: Optional[discord.Guild], period: str = "week", animated: bool = True) -> Optional[discord.File]:
+    """Генерирует графическую карточку топа по сообщениям (PNG или анимированный GIF)."""
+    guild_id = guild.id if guild else 0
+    top_data = tracker.get_top_messages(guild_id, period=period, limit=10)
+    period_labels = {
+        "week": "За неделю",
+        "month": "За месяц",
+        "all": "За всё время",
+    }
+    period_title = period_labels.get(period, "За неделю")
+
+    entries = []
+    fetch_tasks = []
+    members = []
+    for user_id, count in top_data:
+        m = guild.get_member(user_id) if guild else None
+        members.append((user_id, m, count))
+        fetch_tasks.append(_fetch_member_avatar_bytes(m))
+
+    avatar_results = await asyncio.gather(*fetch_tasks, return_exceptions=True) if fetch_tasks else []
+
+    for idx, (user_id, m, count) in enumerate(members):
+        av_bytes = avatar_results[idx] if idx < len(avatar_results) and isinstance(avatar_results[idx], (bytes, bytearray)) else None
+        name = m.display_name if m else f"Участник {user_id}"
+        score_str = f"{count:,} сообщ.".replace(",", " ")
+        entries.append({
+            "rank": idx + 1,
+            "name": name,
+            "score_str": score_str,
+            "avatar_bytes": av_bytes,
+            "is_empty": False
+        })
+
+    try:
+        buf = await asyncio.to_thread(
+            create_leaderboard_card_image,
+            title="ТОП УЧАСТНИКОВ • СЕРВЕР",
+            subtitle="Текстовый чат",
+            period_label=period_title,
+            entries=entries,
+            is_voice=False,
+            animated=animated
+        )
+        ext = "gif" if animated else "png"
+        return discord.File(buf, filename=f"msgs_top.{ext}")
+    except Exception as e:
+        logger.error(f"Ошибка генерации карточки топа сообщений: {e}", exc_info=True)
+        return None
 
 
 def build_voice_top_embed(guild: Optional[discord.Guild], period: str = "week") -> discord.Embed:
@@ -135,48 +272,36 @@ class VoiceTopView(discord.ui.View):
 
     def __init__(self, current_period: str = "week"):
         super().__init__(timeout=None)
-        if current_period == "week":
-            self.btn_week.style = discord.ButtonStyle.primary
-            self.btn_month.style = discord.ButtonStyle.secondary
-            self.btn_all.style = discord.ButtonStyle.secondary
-        elif current_period == "month":
-            self.btn_week.style = discord.ButtonStyle.secondary
-            self.btn_month.style = discord.ButtonStyle.primary
-            self.btn_all.style = discord.ButtonStyle.secondary
-        else:
-            self.btn_week.style = discord.ButtonStyle.secondary
-            self.btn_month.style = discord.ButtonStyle.secondary
-            self.btn_all.style = discord.ButtonStyle.primary
+        self.btn_week.style = discord.ButtonStyle.primary if current_period == "week" else discord.ButtonStyle.secondary
+        self.btn_month.style = discord.ButtonStyle.primary if current_period == "month" else discord.ButtonStyle.secondary
+        self.btn_all.style = discord.ButtonStyle.primary if current_period == "all" else discord.ButtonStyle.secondary
+
+    async def _handle_period_change(self, interaction: discord.Interaction, period: str):
+        try:
+            await interaction.response.defer()
+            card_file = await build_voice_top_card(interaction.guild, period=period, animated=True)
+            view = VoiceTopView(current_period=period)
+            if card_file:
+                await interaction.edit_original_response(attachments=[card_file], embed=None, view=view)
+            else:
+                embed = await asyncio.to_thread(build_voice_top_embed, interaction.guild, period)
+                await interaction.edit_original_response(embed=embed, view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
+        except Exception as e:
+            logger.warning(f"Ошибка при смене периода голосового топа: {e}")
 
     @discord.ui.button(label="📅 За неделю", style=discord.ButtonStyle.primary, custom_id="voicetop_btn_week")
     async def btn_week(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            await interaction.response.defer()
-            embed = await asyncio.to_thread(build_voice_top_embed, interaction.guild, "week")
-            view = VoiceTopView(current_period="week")
-            await interaction.edit_original_response(embed=embed, view=view)
-        except (discord.NotFound, discord.HTTPException):
-            pass
+        await self._handle_period_change(interaction, "week")
 
     @discord.ui.button(label="🗓️ За месяц", style=discord.ButtonStyle.secondary, custom_id="voicetop_btn_month")
     async def btn_month(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            await interaction.response.defer()
-            embed = await asyncio.to_thread(build_voice_top_embed, interaction.guild, "month")
-            view = VoiceTopView(current_period="month")
-            await interaction.edit_original_response(embed=embed, view=view)
-        except (discord.NotFound, discord.HTTPException):
-            pass
+        await self._handle_period_change(interaction, "month")
 
     @discord.ui.button(label="🏆 За всё время", style=discord.ButtonStyle.secondary, custom_id="voicetop_btn_all")
     async def btn_all(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            await interaction.response.defer()
-            embed = await asyncio.to_thread(build_voice_top_embed, interaction.guild, "all")
-            view = VoiceTopView(current_period="all")
-            await interaction.edit_original_response(embed=embed, view=view)
-        except (discord.NotFound, discord.HTTPException):
-            pass
+        await self._handle_period_change(interaction, "all")
 
 
 class MessagesTopView(discord.ui.View):
@@ -184,48 +309,36 @@ class MessagesTopView(discord.ui.View):
 
     def __init__(self, current_period: str = "week"):
         super().__init__(timeout=None)
-        if current_period == "week":
-            self.btn_week.style = discord.ButtonStyle.primary
-            self.btn_month.style = discord.ButtonStyle.secondary
-            self.btn_all.style = discord.ButtonStyle.secondary
-        elif current_period == "month":
-            self.btn_week.style = discord.ButtonStyle.secondary
-            self.btn_month.style = discord.ButtonStyle.primary
-            self.btn_all.style = discord.ButtonStyle.secondary
-        else:
-            self.btn_week.style = discord.ButtonStyle.secondary
-            self.btn_month.style = discord.ButtonStyle.secondary
-            self.btn_all.style = discord.ButtonStyle.primary
+        self.btn_week.style = discord.ButtonStyle.primary if current_period == "week" else discord.ButtonStyle.secondary
+        self.btn_month.style = discord.ButtonStyle.primary if current_period == "month" else discord.ButtonStyle.secondary
+        self.btn_all.style = discord.ButtonStyle.primary if current_period == "all" else discord.ButtonStyle.secondary
+
+    async def _handle_period_change(self, interaction: discord.Interaction, period: str):
+        try:
+            await interaction.response.defer()
+            card_file = await build_messages_top_card(interaction.guild, period=period, animated=True)
+            view = MessagesTopView(current_period=period)
+            if card_file:
+                await interaction.edit_original_response(attachments=[card_file], embed=None, view=view)
+            else:
+                embed = await asyncio.to_thread(build_messages_top_embed, interaction.guild, period)
+                await interaction.edit_original_response(embed=embed, view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
+        except Exception as e:
+            logger.warning(f"Ошибка при смене периода топа сообщений: {e}")
 
     @discord.ui.button(label="📅 За неделю", style=discord.ButtonStyle.primary, custom_id="msgstop_btn_week")
     async def btn_week(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            await interaction.response.defer()
-            embed = await asyncio.to_thread(build_messages_top_embed, interaction.guild, "week")
-            view = MessagesTopView(current_period="week")
-            await interaction.edit_original_response(embed=embed, view=view)
-        except (discord.NotFound, discord.HTTPException):
-            pass
+        await self._handle_period_change(interaction, "week")
 
     @discord.ui.button(label="🗓️ За месяц", style=discord.ButtonStyle.secondary, custom_id="msgstop_btn_month")
     async def btn_month(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            await interaction.response.defer()
-            embed = await asyncio.to_thread(build_messages_top_embed, interaction.guild, "month")
-            view = MessagesTopView(current_period="month")
-            await interaction.edit_original_response(embed=embed, view=view)
-        except (discord.NotFound, discord.HTTPException):
-            pass
+        await self._handle_period_change(interaction, "month")
 
     @discord.ui.button(label="🏆 За всё время", style=discord.ButtonStyle.secondary, custom_id="msgstop_btn_all")
     async def btn_all(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            await interaction.response.defer()
-            embed = await asyncio.to_thread(build_messages_top_embed, interaction.guild, "all")
-            view = MessagesTopView(current_period="all")
-            await interaction.edit_original_response(embed=embed, view=view)
-        except (discord.NotFound, discord.HTTPException):
-            pass
+        await self._handle_period_change(interaction, "all")
 
 
 class LeaderboardsCog(commands.Cog):
@@ -265,14 +378,27 @@ class LeaderboardsCog(commands.Cog):
 
             try:
                 async for msg in channel.history(limit=30):
-                    if msg.author.id == self.bot.user.id and msg.embeds:
-                        title = msg.embeds[0].title or ""
-                        if "голосовому времени" in title:
+                    if msg.author.id == self.bot.user.id:
+                        if voice_msg_id and msg.id == voice_msg_id:
                             existing_voice_msgs.append(msg)
-                        elif "по сообщениям" in title:
+                        elif msgs_msg_id and msg.id == msgs_msg_id:
                             existing_text_msgs.append(msg)
-                        elif "Правила и условия" in title:
+                        elif rules_msg_id and msg.id == rules_msg_id:
                             existing_rules_msgs.append(msg)
+                        elif msg.embeds:
+                            title = msg.embeds[0].title or ""
+                            if "голосовому времени" in title:
+                                existing_voice_msgs.append(msg)
+                            elif "по сообщениям" in title:
+                                existing_text_msgs.append(msg)
+                            elif "Правила и условия" in title:
+                                existing_rules_msgs.append(msg)
+                        elif msg.attachments:
+                            att_names = [a.filename for a in msg.attachments]
+                            if any("voice_top" in a for a in att_names):
+                                existing_voice_msgs.append(msg)
+                            elif any("msgs_top" in a for a in att_names):
+                                existing_text_msgs.append(msg)
             except Exception as e:
                 logger.warning(f"Ошибка при проверке истории #{channel.name}: {e}")
 
@@ -325,10 +451,10 @@ class LeaderboardsCog(commands.Cog):
                 except (discord.NotFound, discord.HTTPException):
                     rules_msg = None
 
-            voice_embed = build_voice_top_embed(guild, period="week")
+            voice_card = await build_voice_top_card(guild, period="week", animated=True)
             voice_view = VoiceTopView(current_period="week")
 
-            msgs_embed = build_messages_top_embed(guild, period="week")
+            msgs_card = await build_messages_top_card(guild, period="week", animated=True)
             msgs_view = MessagesTopView(current_period="week")
 
             rules_embed = build_rules_embed(guild)
@@ -347,8 +473,15 @@ class LeaderboardsCog(commands.Cog):
             if in_correct_order:
                 try:
                     await rules_msg.edit(embed=rules_embed)
-                    await voice_msg.edit(embed=voice_embed, view=voice_view)
-                    await msgs_msg.edit(embed=msgs_embed, view=msgs_view)
+                    if voice_card:
+                        await voice_msg.edit(attachments=[voice_card], embed=None, view=voice_view)
+                    else:
+                        await voice_msg.edit(embed=build_voice_top_embed(guild, period="week"), view=voice_view)
+
+                    if msgs_card:
+                        await msgs_msg.edit(attachments=[msgs_card], embed=None, view=msgs_view)
+                    else:
+                        await msgs_msg.edit(embed=build_messages_top_embed(guild, period="week"), view=msgs_view)
                 except Exception as e:
                     logger.warning(f"Ошибка при обновлении карточек: {e}")
                     in_correct_order = False
@@ -368,9 +501,15 @@ class LeaderboardsCog(commands.Cog):
                 # 1. Первое сообщение: Правила и условия наград
                 rules_msg = await channel.send(embed=rules_embed)
                 # 2. Второе сообщение: Голосовой топ
-                voice_msg = await channel.send(embed=voice_embed, view=voice_view)
+                if voice_card:
+                    voice_msg = await channel.send(file=voice_card, view=voice_view)
+                else:
+                    voice_msg = await channel.send(embed=build_voice_top_embed(guild, period="week"), view=voice_view)
                 # 3. Третье сообщение: Топ по сообщениям
-                msgs_msg = await channel.send(embed=msgs_embed, view=msgs_view)
+                if msgs_card:
+                    msgs_msg = await channel.send(file=msgs_card, view=msgs_view)
+                else:
+                    msgs_msg = await channel.send(embed=build_messages_top_embed(guild, period="week"), view=msgs_view)
 
             # Сохраняем актуальные ID всех 3 сообщений
             tracker.save_top_message_ids(

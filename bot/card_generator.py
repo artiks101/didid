@@ -39,11 +39,43 @@ def draw_chat_icon(draw: ImageDraw.ImageDraw, x: int, y: int, size: int = 24, co
     draw.polygon([(x + 4, y + size - 5), (x + 11, y + size - 5), (x + 4, y + size + 3)], fill=color)
 
 
-def draw_mic_icon(draw: ImageDraw.ImageDraw, x: int, y: int, color=(46, 204, 113, 255)):
-    draw.rounded_rectangle([(x + 6, y), (x + 18, y + 16)], radius=6, fill=color)
-    draw.arc([(x + 2, y + 6), (x + 22, y + 22)], 0, 180, fill=color, width=3)
-    draw.line([(x + 12, y + 22), (x + 12, y + 28)], fill=color, width=3)
-    draw.line([(x + 6, y + 28), (x + 18, y + 28)], fill=color, width=3)
+def draw_mic_icon(draw: ImageDraw.ImageDraw, x: int, y: int, size: int = 24, color=(46, 204, 113, 255)):
+    s_f = size / 24.0
+    draw.rounded_rectangle(
+        [(x + int(6 * s_f), y), (x + int(18 * s_f), y + int(16 * s_f))],
+        radius=max(2, int(6 * s_f)),
+        fill=color
+    )
+    draw.arc(
+        [(x + int(2 * s_f), y + int(6 * s_f)), (x + int(22 * s_f), y + int(22 * s_f))],
+        0, 180, fill=color, width=max(2, int(3 * s_f))
+    )
+    draw.line(
+        [(x + int(12 * s_f), y + int(22 * s_f)), (x + int(12 * s_f), y + int(28 * s_f))],
+        fill=color, width=max(2, int(3 * s_f))
+    )
+    draw.line(
+        [(x + int(6 * s_f), y + int(28 * s_f)), (x + int(18 * s_f), y + int(28 * s_f))],
+        fill=color, width=max(2, int(3 * s_f))
+    )
+
+
+def draw_crown_icon(draw: ImageDraw.ImageDraw, x: int, y: int, size: int = 24, color=(241, 196, 15, 255)):
+    s_f = size / 24.0
+    pts = [
+        (x + int(2 * s_f), y + int(18 * s_f)),
+        (x + int(22 * s_f), y + int(18 * s_f)),
+        (x + int(20 * s_f), y + int(6 * s_f)),
+        (x + int(15 * s_f), y + int(12 * s_f)),
+        (x + int(12 * s_f), y + int(2 * s_f)),
+        (x + int(9 * s_f), y + int(12 * s_f)),
+        (x + int(4 * s_f), y + int(6 * s_f)),
+    ]
+    draw.polygon(pts, fill=color)
+    draw.rectangle(
+        [(x + int(3 * s_f), y + int(19 * s_f)), (x + int(21 * s_f), y + int(22 * s_f))],
+        fill=color
+    )
 
 
 def draw_trophy_icon(draw: ImageDraw.ImageDraw, x: int, y: int, color=(241, 196, 15, 255)):
@@ -366,6 +398,295 @@ def create_profile_card_image(
     num_frames = 16
     frames = []
     bg_color = (49, 51, 56)  # Цвет темы Discord Dark для бесшовных скругленных углов
+    for i in range(num_frames):
+        shift_px = int((i / num_frames) * w)
+        bar = strip.crop((shift_px, 0, shift_px + w, stripe_h))
+        f = card.copy()
+        f.paste(bar, (0, 0), top_corner_mask)
+        flat = Image.new("RGB", (w, h), bg_color)
+        flat.paste(f, (0, 0), f)
+        frames.append(flat)
+
+    pal_img = frames[0].convert("P", palette=Image.Palette.ADAPTIVE, colors=256)
+    p_frames = [f.quantize(palette=pal_img, dither=Image.Dither.NONE) for f in frames]
+
+    buffer = io.BytesIO()
+    p_frames[0].save(
+        buffer,
+        format="GIF",
+        save_all=True,
+        append_images=p_frames[1:],
+        duration=65,
+        loop=0
+    )
+    buffer.seek(0)
+    return buffer
+
+
+def create_leaderboard_card_image(
+    title: str,
+    subtitle: str,
+    period_label: str,
+    entries: list[dict],
+    is_voice: bool = True,
+    animated: bool = True,
+    theme: Optional[CardTheme] = None
+) -> io.BytesIO:
+    """
+    Генерирует 2X Retina графическую карточку топа участников сервера (10 мест в 2 колонки)
+    в едином дизайн-стиле с карточкой профиля (/me):
+    - Тёмная тема Discord #232428 и сплошная матовая шапка #212326
+    - Топ-1, Топ-2, Топ-3 с золотым, серебряным и бронзовым оформлением
+    - Аватары участников с защитным сглаженным кольцом
+    - Пилюли статистики с иконками (микрофон/сообщения)
+    - Анимированная бегущая неоновая полоска (16-frame GIF)
+    """
+    w, h = 1200, 1040
+    active_theme = theme or DEFAULT_THEME
+    card = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(card)
+
+    # 1. Основной фон карточки
+    draw.rounded_rectangle([(0, 0), (w, h)], radius=36, fill=active_theme.card_bg, outline=active_theme.card_border, width=3)
+    if active_theme.card_bg_image_bytes:
+        try:
+            bg_art = Image.open(io.BytesIO(active_theme.card_bg_image_bytes)).convert("RGBA")
+            bg_art = bg_art.resize((w, h), Image.Resampling.LANCZOS)
+            bg_mask = Image.new("L", (w, h), 0)
+            ImageDraw.Draw(bg_mask).rounded_rectangle([(0, 0), (w, h)], radius=36, fill=255)
+            card.paste(bg_art, (0, 0), bg_mask)
+        except Exception:
+            pass
+
+    # 2. Верхний баннер
+    banner_h = 190
+    b_mask_full = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(b_mask_full).rounded_rectangle([(0, 0), (w, h)], radius=36, fill=255)
+    b_mask = b_mask_full.crop((0, 0, w, banner_h))
+
+    if active_theme.banner_image_bytes:
+        try:
+            b_art = Image.open(io.BytesIO(active_theme.banner_image_bytes)).convert("RGBA")
+            b_art = b_art.resize((w, banner_h), Image.Resampling.LANCZOS)
+            card.paste(b_art, (0, 0), b_mask)
+        except Exception:
+            pass
+    else:
+        banner = Image.new("RGBA", (w, banner_h), active_theme.banner_color)
+        card.paste(banner, (0, 0), b_mask)
+
+    draw.line([(0, banner_h), (w, banner_h)], fill=active_theme.banner_border, width=2)
+
+    # 3. Содержимое баннера: иконка слева, заголовки и бейдж периода справа
+    icon_circle_r = 44
+    ic_cx, ic_cy = 104, 104
+    icon_bg = (43, 45, 49, 255)
+    accent_theme = (46, 204, 113, 255) if is_voice else (88, 101, 242, 255)
+    draw.ellipse(
+        [(ic_cx - icon_circle_r, ic_cy - icon_circle_r), (ic_cx + icon_circle_r, ic_cy + icon_circle_r)],
+        fill=icon_bg,
+        outline=accent_theme,
+        width=3
+    )
+    if is_voice:
+        draw_mic_icon(draw, ic_cx - 20, ic_cy - 23, size=40, color=accent_theme)
+    else:
+        draw_chat_icon(draw, ic_cx - 20, ic_cy - 20, size=40, color=accent_theme)
+
+    font_sub_top = get_font(20, bold=True)
+    draw.text((170, 70), title.upper(), fill=(148, 155, 164, 255), font=font_sub_top)
+    font_main_top = get_font(38, bold=True)
+    draw.text((170, 100), subtitle, fill=(255, 255, 255, 255), font=font_main_top)
+
+    # Бейдж периода справа
+    font_period = get_font(21, bold=True)
+    clean_period = period_label.strip()
+    p_len = int(draw.textlength(clean_period, font=font_period))
+    p_w = p_len + 60
+    p_h = 56
+    p_x = 1140 - p_w
+    p_y = 76
+    draw.rounded_rectangle([(p_x, p_y), (p_x + p_w, p_y + p_h)], radius=28, fill=(43, 45, 49, 255), outline=accent_theme, width=2)
+    dot_r = 6
+    draw.ellipse([(p_x + 22 - dot_r, p_y + 28 - dot_r), (p_x + 22 + dot_r, p_y + 28 + dot_r)], fill=accent_theme)
+    draw.text((p_x + 38, p_y + 14), clean_period, fill=(255, 255, 255, 255), font=font_period)
+
+    # 4. Две колонки по 5 строк: 10 участников
+    col_w = 520
+    row_h = 122
+    row_gap = 18
+    start_y = 224
+
+    font_rank = get_font(24, bold=True)
+    font_name = get_font(23, bold=True)
+    font_score = get_font(22, bold=True)
+    font_empty = get_font(22, bold=False)
+
+    padded_entries = list(entries)
+    while len(padded_entries) < 10:
+        padded_entries.append({
+            "rank": len(padded_entries) + 1,
+            "name": "—",
+            "score_str": "—",
+            "avatar_bytes": None,
+            "is_empty": True
+        })
+
+    for idx, item in enumerate(padded_entries[:10]):
+        rank = idx + 1
+        is_left = (idx < 5)
+        col_x = 60 if is_left else 620
+        row_idx = idx if is_left else (idx - 5)
+        box_y1 = start_y + row_idx * (row_h + row_gap)
+        box_y2 = box_y1 + row_h
+        box_cy = box_y1 + row_h // 2
+
+        if rank == 1:
+            box_outline = (255, 204, 0, 255)
+            box_border_w = 3
+            rank_bg = (255, 204, 0, 255)
+            rank_text_col = (30, 31, 34, 255)
+        elif rank == 2:
+            box_outline = (195, 205, 215, 255)
+            box_border_w = 2
+            rank_bg = (195, 205, 215, 255)
+            rank_text_col = (30, 31, 34, 255)
+        elif rank == 3:
+            box_outline = (215, 140, 75, 255)
+            box_border_w = 2
+            rank_bg = (215, 140, 75, 255)
+            rank_text_col = (30, 31, 34, 255)
+        else:
+            box_outline = active_theme.box_border
+            box_border_w = 2
+            rank_bg = (43, 45, 49, 255)
+            rank_text_col = (148, 155, 164, 255)
+
+        draw.rounded_rectangle([(col_x, box_y1), (col_x + col_w, box_y2)], radius=22, fill=active_theme.box_bg, outline=box_outline, width=box_border_w)
+
+        # 1. Значок ранга
+        rank_r = 22
+        rk_cx, rk_cy = col_x + 38, box_cy
+        draw.ellipse([(rk_cx - rank_r, rk_cy - rank_r), (rk_cx + rank_r, rk_cy + rank_r)], fill=rank_bg)
+        if rank == 1:
+            draw_crown_icon(draw, rk_cx - 12, rk_cy - 12, size=24, color=rank_text_col)
+        else:
+            rk_str = str(rank)
+            rw = int(draw.textlength(rk_str, font=font_rank))
+            draw.text((rk_cx - rw // 2, rk_cy - 16), rk_str, fill=rank_text_col, font=font_rank)
+
+        # 2. Аватарка (центр x = col_x + 98, radius = 35)
+        av_r = 35
+        av_cx, av_cy = col_x + 98, box_cy
+        is_empty = item.get("is_empty", False)
+        av_drawn = False
+
+        if not is_empty and item.get("avatar_bytes"):
+            try:
+                av_img = Image.open(io.BytesIO(item["avatar_bytes"])).convert("RGBA")
+                corners = [(0, 0), (av_img.width - 1, 0), (0, av_img.height - 1), (av_img.width - 1, av_img.height - 1)]
+                white_corners = sum(1 for pt in corners if sum(av_img.getpixel(pt)[:3]) / 3 > 235)
+                if white_corners >= 3:
+                    for pt in corners:
+                        pix = av_img.getpixel(pt)
+                        if sum(pix[:3]) / 3 > 230 and pix[3] > 0:
+                            ImageDraw.floodfill(av_img, pt, (0, 0, 0, 0), thresh=25)
+
+                s = 4
+                w_orig, h_orig = av_img.size
+                min_dim = min(w_orig, h_orig)
+                cx, cy = w_orig // 2, h_orig // 2
+                av_sq = av_img.crop((cx - min_dim // 2, cy - min_dim // 2, cx + min_dim // 2, cy + min_dim // 2))
+                av_scaled = av_sq.resize((av_r * 2, av_r * 2), Image.Resampling.LANCZOS)
+
+                mask_hi = Image.new("L", (av_r * 2 * s, av_r * 2 * s), 0)
+                ImageDraw.Draw(mask_hi).ellipse([(0, 0), (av_r * 2 * s - 1, av_r * 2 * s - 1)], fill=255)
+                mask = mask_hi.resize((av_r * 2, av_r * 2), Image.Resampling.LANCZOS)
+                card.paste(av_scaled, (av_cx - av_r, av_cy - av_r), mask)
+                av_drawn = True
+            except Exception:
+                av_drawn = False
+
+        if not av_drawn:
+            fill_col = (43, 45, 49, 255) if is_empty else ((88, 101, 242, 255) if rank % 2 == 0 else (46, 204, 113, 255))
+            draw.ellipse([(av_cx - av_r, av_cy - av_r), (av_cx + av_r, av_cy + av_r)], fill=fill_col)
+            initial = "?" if is_empty else (clean_emoji_text(item.get("name", "U"))[:1].upper() or "U")
+            init_w = int(draw.textlength(initial, font=font_rank))
+            draw.text((av_cx - init_w // 2, av_cy - 16), initial, fill=(255, 255, 255, 255), font=font_rank)
+
+        # Защитное кольцо вокруг авы в цвет плашки
+        ring_box = av_r + 6
+        s = 4
+        ring_hi = Image.new("RGBA", (ring_box * 2 * s, ring_box * 2 * s), (0, 0, 0, 0))
+        r_draw = ImageDraw.Draw(ring_hi)
+        c_ring = ring_box * s
+        r_draw.ellipse(
+            [(c_ring - (av_r + 4) * s, c_ring - (av_r + 4) * s), (c_ring + (av_r + 4) * s, c_ring + (av_r + 4) * s)],
+            fill=active_theme.box_bg
+        )
+        r_draw.ellipse(
+            [(c_ring - (av_r - 2) * s, c_ring - (av_r - 2) * s), (c_ring + (av_r - 2) * s, c_ring + (av_r - 2) * s)],
+            fill=(0, 0, 0, 0)
+        )
+        ring_img = ring_hi.resize((ring_box * 2, ring_box * 2), Image.Resampling.LANCZOS)
+        card.paste(ring_img, (av_cx - ring_box, av_cy - ring_box), ring_img)
+
+        # 3. Пилюля с результатом (справа)
+        score_str = item.get("score_str", "—")
+        if not is_empty:
+            sc_len = int(draw.textlength(score_str, font=font_score))
+            pill_w = sc_len + (52 if is_voice else 48)
+            pill_h = 48
+            pill_x = col_x + col_w - 18 - pill_w
+            pill_y = box_cy - pill_h // 2
+            pill_color = (46, 204, 113, 255) if is_voice else (88, 101, 242, 255)
+
+            draw.rounded_rectangle([(pill_x, pill_y), (pill_x + pill_w, pill_y + pill_h)], radius=24, fill=(24, 25, 28, 255), outline=pill_color, width=2)
+            if is_voice:
+                draw_mic_icon(draw, pill_x + 14, pill_y + 13, size=20, color=pill_color)
+            else:
+                draw_chat_icon(draw, pill_x + 14, pill_y + 14, size=18, color=pill_color)
+            draw.text((pill_x + 42, pill_y + 10), score_str, fill=(255, 255, 255, 255), font=font_score)
+            max_name_w = pill_x - (av_cx + av_r + 18) - 10
+        else:
+            max_name_w = col_w - 180
+
+        # 4. Имя пользователя
+        name = clean_emoji_text(item.get("name", "—"))
+        if not name:
+            name = item.get("name", "—")
+        if is_empty:
+            draw.text((av_cx + av_r + 18, box_cy - 14), "— Свободно —", fill=(115, 118, 128, 255), font=font_empty)
+        else:
+            name_x = av_cx + av_r + 18
+            while draw.textlength(name, font=font_name) > max_name_w and len(name) > 3:
+                name = name[:-2] + "…"
+            draw.text((name_x, box_cy - 16), name, fill=(255, 255, 255, 255), font=font_name)
+
+    # 5. Футер
+    draw.line([(60, 946), (1140, 946)], fill=active_theme.box_border, width=2)
+    font_footer = get_font(21, bold=False)
+    draw.text((60, 972), "Обновляется каждые 15 минут • Нажимайте кнопки под сообщением для выбора периода", fill=(115, 118, 128, 255), font=font_footer)
+
+    # 6. Верхняя неоновая полоска
+    stripe_h = 10
+    strip = create_accent_strip(w, stripe_h, colors=active_theme.accent_colors)
+    tcm_full = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(tcm_full).rounded_rectangle([(0, 0), (w, h)], radius=36, fill=255)
+    top_corner_mask = tcm_full.crop((0, 0, w, stripe_h))
+
+    if not animated:
+        bar = strip.crop((0, 0, w, stripe_h))
+        card.paste(bar, (0, 0), top_corner_mask)
+        buffer = io.BytesIO()
+        card.save(buffer, format="PNG")
+        buffer.seek(0)
+        return buffer
+
+    # Генерация 16-кадрового плавного циклического GIF
+    num_frames = 16
+    frames = []
+    bg_color = (49, 51, 56)
     for i in range(num_frames):
         shift_px = int((i / num_frames) * w)
         bar = strip.crop((shift_px, 0, shift_px + w, stripe_h))
