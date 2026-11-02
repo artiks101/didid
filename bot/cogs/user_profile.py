@@ -30,15 +30,12 @@ def is_afk_channel(channel: Optional[Union[discord.VoiceChannel, discord.StageCh
 
 
 def format_voice_duration(seconds: float) -> str:
-    """Форматирует секунды голосового чата в читаемый вид (дни, часы, минуты, секунды)."""
+    """Форматирует секунды голосового чата в читаемый вид (часы, минуты, секунды)."""
     secs = int(seconds)
-    days, rem = divmod(secs, 86400)
-    hours, rem = divmod(rem, 3600)
+    hours, rem = divmod(secs, 3600)
     mins, s = divmod(rem, 60)
 
     parts = []
-    if days > 0:
-        parts.append(f"{days} дн.")
     if hours > 0:
         parts.append(f"{hours} ч.")
     if mins > 0:

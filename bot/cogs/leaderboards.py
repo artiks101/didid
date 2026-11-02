@@ -22,13 +22,10 @@ _TOP_CARD_CACHE: dict[tuple[int, str, str], tuple[bytes, float]] = {}
 
 
 def format_voice_duration_short(seconds: float) -> str:
-    """Компактное форматирование времени для аккуратного размещения в пилюлях карточки топа."""
+    """Компактное форматирование времени для аккуратного размещения в пилюлях карточки топа (только в часах и минутах)."""
     secs = int(seconds)
-    days, rem = divmod(secs, 86400)
-    hours, rem = divmod(rem, 3600)
+    hours, rem = divmod(secs, 3600)
     mins, s = divmod(rem, 60)
-    if days > 0:
-        return f"{days} дн. {hours} ч." if hours > 0 else f"{days} дн."
     if hours > 0:
         return f"{hours} ч. {mins} мин." if mins > 0 else f"{hours} ч."
     if mins > 0:
