@@ -68,8 +68,9 @@ class CardTheme:
     name: str = "Discord Dark"
     card_bg: tuple[int, int, int, int] = (35, 36, 40, 255)         # #232428 (тело карточки)
     card_border: tuple[int, int, int, int] = (55, 57, 63, 255)     # #37393f
-    banner_top: tuple[int, int, int] = (45, 47, 52)                # #2d2f34 (верх шапки)
-    banner_bottom: tuple[int, int, int] = (24, 25, 28)             # #18191c (низ шапки)
+    banner_top: tuple[int, int, int] = (48, 51, 58)                # #30333a (верх шапки)
+    banner_bottom: tuple[int, int, int] = (24, 25, 29)             # #18191d (низ шапки)
+    banner_border: tuple[int, int, int, int] = (65, 68, 76, 255)   # Линия разделителя шапки и тела
     banner_image_bytes: Optional[bytes] = None                      # Кастомный арт шапки (для покупки)
     card_bg_image_bytes: Optional[bytes] = None                     # Кастомный фон всей карточки (для покупки)
     box_bg: tuple[int, int, int, int] = (30, 31, 34, 255)          # #1e1f22 (плашки со статистикой)
@@ -145,13 +146,14 @@ def create_profile_card_image(
 
     # 2. Верхний баннер (600x110 в 2X = 1200x220)
     banner_h = 220
+    b_mask_full = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(b_mask_full).rounded_rectangle([(0, 0), (w, h)], radius=36, fill=255)
+    b_mask = b_mask_full.crop((0, 0, w, banner_h))
+
     if active_theme.banner_image_bytes:
         try:
             b_art = Image.open(io.BytesIO(active_theme.banner_image_bytes)).convert("RGBA")
             b_art = b_art.resize((w, banner_h), Image.Resampling.LANCZOS)
-            b_mask_full = Image.new("L", (w, h), 0)
-            ImageDraw.Draw(b_mask_full).rounded_rectangle([(0, 0), (w, h)], radius=36, fill=255)
-            b_mask = b_mask_full.crop((0, 0, w, banner_h))
             card.paste(b_art, (0, 0), b_mask)
         except Exception:
             pass
@@ -164,7 +166,10 @@ def create_profile_card_image(
             g = int(active_theme.banner_top[1] * (1 - ratio) + active_theme.banner_bottom[1] * ratio)
             b = int(active_theme.banner_top[2] * (1 - ratio) + active_theme.banner_bottom[2] * ratio)
             b_draw.line([(0, y), (w, y)], fill=(r, g, b, 255))
-        card.paste(banner, (0, 0), banner)
+        card.paste(banner, (0, 0), b_mask)
+
+    # Четкая линия-разделитель между шапкой и телом карточки (как в Figma)
+    draw.line([(0, banner_h), (w, banner_h)], fill=active_theme.banner_border, width=3)
 
     # 3. Аватарка: Центр x=140, y=220 (аккуратно на линии стыка баннера), диаметр 160 (r=80)
     av_x, av_y, av_r = 140, 220, 80
@@ -261,8 +266,8 @@ def create_profile_card_image(
             t_w = int(draw.textlength(r_name, font=font_badge))
             b_w = t_w + 44
             badge_x -= b_w
-            draw.rounded_rectangle([(badge_x, 240), (badge_x + b_w, 298)], radius=28, fill=(43, 45, 49, 255), outline=r_color, width=2)
-            draw.text((badge_x + 22, 254), r_name, fill=r_color, font=font_badge)
+            draw.rounded_rectangle([(badge_x, 192), (badge_x + b_w, 250)], radius=29, fill=(43, 45, 49, 255), outline=r_color, width=2)
+            draw.text((badge_x + 22, 206), r_name, fill=r_color, font=font_badge)
             badge_x -= 18
 
     # 5. Имя пользователя и бейдж "УЧАСТНИК"
