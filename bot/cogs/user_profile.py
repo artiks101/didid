@@ -432,13 +432,14 @@ class UserActivityTracker:
             pass
         return voice_wins, chat_wins
 
-    def get_stats(self, user_id: int, guild_id: int) -> tuple[int, float, Optional[float]]:
+    def get_stats(self, user_id: int, guild_id: int) -> tuple[int, float, Optional[float], float]:
         msg_count = 0
         voice_secs = 0.0
         current_session = None
+        active_days = 0
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=5.0) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "SELECT message_count, voice_seconds FROM user_activity WHERE user_id=? AND guild_id=?",
@@ -449,13 +450,30 @@ class UserActivityTracker:
                     msg_count = row[0] or 0
                     voice_secs = row[1] or 0.0
 
+                # Количество уникальных дней с голосовой активностью
+                cursor.execute(
+                    "SELECT COUNT(DISTINCT date) FROM activity_daily WHERE user_id=? AND guild_id=? AND voice_seconds > 0",
+                    (user_id, guild_id)
+                )
+                row_days = cursor.fetchone()
+                if row_days and row_days[0]:
+                    active_days = row_days[0]
+
+                # Проверяем, есть ли уже сохраненная активность за сегодня
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                cursor.execute(
+                    "SELECT 1 FROM activity_daily WHERE user_id=? AND guild_id=? AND date=? AND voice_seconds > 0",
+                    (user_id, guild_id, today_str)
+                )
+                today_exists = cursor.fetchone() is not None
+
                 # Проверяем также сообщения в таблице messages
                 cursor.execute("SELECT COUNT(*) FROM messages WHERE author_id=?", (user_id,))
                 cached_msgs = cursor.fetchone()
                 if cached_msgs and cached_msgs[0] > msg_count:
                     msg_count = cached_msgs[0]
         except Exception:
-            pass
+            today_exists = False
 
         # Если участник прямо сейчас в голосовом канале:
         # к уже сохраненным в БД секундам прибавляем несинхронизированные секунды текущего интервала
@@ -467,7 +485,16 @@ class UserActivityTracker:
             start_sess = self._session_start.get(user_id, last_time)
             current_session = max(0.0, time.time() - start_sess)
 
-        return msg_count, voice_secs, current_session
+            # Если сегодня еще не сохранялось в activity_daily, добавляем сегодняшний день
+            if not today_exists:
+                active_days += 1
+
+        if active_days == 0 and voice_secs > 0:
+            active_days = 1
+
+        avg_daily = (voice_secs / active_days) if active_days > 0 else 0.0
+
+        return msg_count, voice_secs, current_session, avg_daily
 
 
 tracker = UserActivityTracker()
@@ -579,7 +606,7 @@ class UserProfileCog(commands.Cog):
     def _build_me_embed(self, member: discord.Member, is_self: bool = True) -> discord.Embed:
         guild = getattr(member, "guild", None)
         guild_id = guild.id if guild else 0
-        msg_count, voice_secs, current_session = tracker.get_stats(member.id, guild_id)
+        msg_count, voice_secs, current_session, avg_daily = tracker.get_stats(member.id, guild_id)
         voice_wins, chat_wins = tracker.get_user_wins(member.id, guild_id)
 
         # Время на сервере
@@ -593,6 +620,10 @@ class UserProfileCog(commands.Cog):
 
         # Голосовое время
         voice_str = format_voice_duration(voice_secs)
+        avg_line = ""
+        if voice_secs > 0:
+            avg_line = f"\n⏱️ В среднем: **{format_voice_duration(avg_daily)}** в день"
+
         voice_extra = ""
         in_afk = hasattr(member, "voice") and member.voice and member.voice.channel and is_afk_channel(member.voice.channel)
         if in_afk:
@@ -626,7 +657,7 @@ class UserProfileCog(commands.Cog):
 
         embed.add_field(name="📅 На сервере", value=days_str, inline=False)
         embed.add_field(name="💬 Написано сообщений", value=f"**{msg_count}** сообщений", inline=True)
-        embed.add_field(name="🎙️ Время в голосовых", value=f"**{voice_str}**{voice_extra}", inline=True)
+        embed.add_field(name="🎙️ Время в голосовых", value=f"**{voice_str}**{avg_line}{voice_extra}", inline=True)
         embed.add_field(name="🏆 Победы в Топ-1 месяца", value=wins_str, inline=False)
         embed.add_field(name=roles_label, value=roles_str, inline=False)
 
