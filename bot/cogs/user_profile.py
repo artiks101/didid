@@ -795,7 +795,8 @@ class UserProfileCog(commands.Cog):
                 chat_wins=chat_wins,
                 created_date_str=created_date_str,
                 roles=roles,
-                avatar_bytes=avatar_bytes
+                avatar_bytes=avatar_bytes,
+                animated=True
             )
         except Exception:
             return None
@@ -816,17 +817,30 @@ class UserProfileCog(commands.Cog):
 
         is_self = (caller is not None and target.id == caller.id)
         try:
+            # Мгновенный defer (ephemeral), чтобы не истек 3-секундный таймаут Discord при генерации GIF
+            await interaction.response.defer(ephemeral=True)
+
             target_guild = getattr(target, "guild", None) or interaction.guild
             guild_id = target_guild.id if target_guild else 0
             stats = tracker.get_stats(target.id, guild_id)
             card_buf = await self._render_profile_card(target, stats)
 
             if card_buf:
-                file = discord.File(fp=card_buf, filename="profile_card.png")
-                await interaction.response.send_message(file=file, ephemeral=True)
+                file = discord.File(fp=card_buf, filename="profile_card.gif")
+                await interaction.followup.send(file=file, ephemeral=True)
             else:
                 embed = self._build_me_embed(target, is_self=is_self)
-                await interaction.response.send_message(embed=embed, ephemeral=True)
+                await interaction.followup.send(embed=embed, ephemeral=True)
+
+            # Автоматическое удаление через 3 минуты (180 сек), если пользователь не скрыл сам
+            async def _auto_delete():
+                await asyncio.sleep(180)
+                try:
+                    await interaction.delete_original_response()
+                except Exception:
+                    pass
+
+            asyncio.create_task(_auto_delete())
         except (discord.NotFound, discord.HTTPException):
             pass
 
@@ -846,18 +860,18 @@ class UserProfileCog(commands.Cog):
             pass
 
         if card_buf:
-            file = discord.File(fp=card_buf, filename="profile_card.png")
+            file = discord.File(fp=card_buf, filename="profile_card.gif")
             try:
                 await ctx.author.send(file=file)
             except Exception:
                 file.fp.seek(0)
-                await ctx.send(file=file, delete_after=35)
+                await ctx.send(file=file, delete_after=180)
         else:
             embed = self._build_me_embed(target, is_self=is_self)
             try:
                 await ctx.author.send(embed=embed)
             except Exception:
-                await ctx.send(embed=embed, delete_after=25)
+                await ctx.send(embed=embed, delete_after=180)
 
 
 async def setup(bot: commands.Bot):

@@ -60,6 +60,33 @@ def draw_clock_icon(draw: ImageDraw.ImageDraw, x: int, y: int, size: int = 20, c
     draw.line([(cx, cy), (cx + 5, cy)], fill=color, width=2)
 
 
+ACCENT_COLORS = [
+    (46, 204, 113),   # Зеленый
+    (26, 188, 156),   # Бирюзовый
+    (52, 152, 219),   # Синий
+    (155, 89, 182),   # Пурпурный
+    (235, 69, 158),   # Розовый
+    (46, 204, 113),   # Замыкание в зеленый для бесшовного цикла
+]
+
+
+def create_accent_strip(w: int, h: int = 10) -> Image.Image:
+    """Генерирует бесшовную циклическую полоску градиента шириной 2 * w для плавной анимации."""
+    strip = Image.new("RGBA", (w * 2, h))
+    draw = ImageDraw.Draw(strip)
+    n_segs = len(ACCENT_COLORS) - 1
+    for x in range(w * 2):
+        pos = (x / w) % 1.0
+        seg = min(int(pos * n_segs), n_segs - 1)
+        sub = (pos * n_segs) - seg
+        c1, c2 = ACCENT_COLORS[seg], ACCENT_COLORS[seg + 1]
+        r = int(c1[0] * (1 - sub) + c2[0] * sub)
+        g = int(c1[1] * (1 - sub) + c2[1] * sub)
+        b = int(c1[2] * (1 - sub) + c2[2] * sub)
+        draw.line([(x, 0), (x, h)], fill=(r, g, b, 255))
+    return strip
+
+
 def create_profile_card_image(
     display_name: str,
     handle: str,
@@ -74,7 +101,8 @@ def create_profile_card_image(
     chat_wins: int,
     created_date_str: str,
     roles: list[tuple[str, tuple[int, int, int, int]]],
-    avatar_bytes: Optional[bytes] = None
+    avatar_bytes: Optional[bytes] = None,
+    animated: bool = True
 ) -> io.BytesIO:
     """Генерирует сверхчёткую 2X Retina графическую карточку профиля участника."""
     # Разрешение 1200 x 1040 (2x от 600x520) для идеальной чёткости на любых экранах
@@ -96,24 +124,6 @@ def create_profile_card_image(
         b = int(52 * (1 - ratio) + 28 * ratio)
         b_draw.line([(0, y), (w, y)], fill=(r, g, b, 255))
     card.paste(banner, (0, 0), banner)
-
-    # Радужная акцентная полоска на самом верху баннера (8px)
-    accent_bar = Image.new("RGBA", (w, 8), (0, 0, 0, 0))
-    a_draw = ImageDraw.Draw(accent_bar)
-    for x in range(w):
-        ratio = x / w
-        if ratio < 0.5:
-            sub = ratio / 0.5
-            r = int(46 * (1 - sub) + 52 * sub)
-            g = int(204 * (1 - sub) + 152 * sub)
-            b = int(113 * (1 - sub) + 219 * sub)
-        else:
-            sub = (ratio - 0.5) / 0.5
-            r = int(52 * (1 - sub) + 155 * sub)
-            g = int(152 * (1 - sub) + 89 * sub)
-            b = int(219 * (1 - sub) + 182 * sub)
-        a_draw.line([(x, 0), (x, 8)], fill=(r, g, b, 255))
-    card.paste(accent_bar, (0, 0), accent_bar)
 
     # 3. Аватарка: Центр x=140, y=220 (аккуратно на линии стыка баннера), диаметр 160 (r=80)
     av_x, av_y, av_r = 140, 220, 80
@@ -296,7 +306,47 @@ def create_profile_card_image(
     font_footer = get_font(21, bold=False)
     draw.text((60, 966), f"Аккаунт создан: {created_date_str} • ID: {user_id}", fill=(115, 118, 128, 255), font=font_footer)
 
+    # 10. Верхняя неоновая полоска (статичная или анимированная бегущая волна)
+    stripe_h = 10
+    strip = create_accent_strip(w, stripe_h)
+
+    # Маска скругления для верхних углов карточки (radius 36)
+    tcm_full = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(tcm_full).rounded_rectangle([(0, 0), (w, h)], radius=36, fill=255)
+    top_corner_mask = tcm_full.crop((0, 0, w, stripe_h))
+
+    if not animated:
+        bar = strip.crop((0, 0, w, stripe_h))
+        card.paste(bar, (0, 0), top_corner_mask)
+        buffer = io.BytesIO()
+        card.save(buffer, format="PNG")
+        buffer.seek(0)
+        return buffer
+
+    # Генерация 16-кадрового плавного циклического GIF
+    num_frames = 16
+    frames = []
+    bg_color = (49, 51, 56)  # Цвет темы Discord Dark для бесшовных скругленных углов
+    for i in range(num_frames):
+        shift_px = int((i / num_frames) * w)
+        bar = strip.crop((shift_px, 0, shift_px + w, stripe_h))
+        f = card.copy()
+        f.paste(bar, (0, 0), top_corner_mask)
+        flat = Image.new("RGB", (w, h), bg_color)
+        flat.paste(f, (0, 0), f)
+        frames.append(flat)
+
+    pal_img = frames[0].convert("P", palette=Image.Palette.ADAPTIVE, colors=256)
+    p_frames = [f.quantize(palette=pal_img, dither=Image.Dither.NONE) for f in frames]
+
     buffer = io.BytesIO()
-    card.save(buffer, format="PNG")
+    p_frames[0].save(
+        buffer,
+        format="GIF",
+        save_all=True,
+        append_images=p_frames[1:],
+        duration=65,
+        loop=0
+    )
     buffer.seek(0)
     return buffer
