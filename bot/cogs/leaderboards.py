@@ -814,6 +814,7 @@ class LeaderboardsCog(commands.Cog):
         # Регистрируем персистентные кнопки для мгновенной обработки после перезапуска
         self.bot.add_view(VoiceTopView("week"))
         self.bot.add_view(MessagesTopView("week"))
+        tracker.sync_message_counts(self.bot)
         for guild in self.bot.guilds:
             asyncio.create_task(self.precache_all_periods(guild))
 

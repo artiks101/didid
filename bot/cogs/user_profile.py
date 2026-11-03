@@ -169,6 +169,73 @@ class UserActivityTracker:
         except Exception:
             pass
 
+        self.sync_message_counts()
+
+    def sync_message_counts(self, bot: Optional[commands.Bot] = None):
+        """
+        Синхронизирует счетчики сообщений между кэшем messages и таблицами user_activity / activity_daily.
+        Гарантирует единый источник правды: в профиле (/me) и в топах всегда отображается одинаковое число сообщений.
+        """
+        try:
+            with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+                conn.execute("PRAGMA busy_timeout = 5000")
+                cursor = conn.cursor()
+
+                # Проверяем существование таблицы messages
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'")
+                if not cursor.fetchone():
+                    return
+
+                # Карта channel_id -> guild_id
+                chan_guild_map: dict[int, int] = {}
+                default_guild_id = Config.GUILD_ID or 0
+                if bot:
+                    for g in bot.guilds:
+                        if not default_guild_id:
+                            default_guild_id = g.id
+                        for ch in g.channels:
+                            chan_guild_map[ch.id] = g.id
+
+                # 1. Посуточная синхронизация по (channel_id, author_id, date)
+                cursor.execute("""
+                    SELECT channel_id, author_id, strftime('%Y-%m-%d', created_at, 'unixepoch') as msg_date, COUNT(*) as cnt
+                    FROM messages
+                    WHERE author_id IS NOT NULL AND created_at IS NOT NULL
+                    GROUP BY channel_id, author_id, msg_date
+                """)
+                daily_rows = cursor.fetchall()
+
+                # Агрегируем по (guild_id, author_id, msg_date) и (guild_id, author_id)
+                guild_daily: dict[tuple[int, int, str], int] = {}
+                guild_totals: dict[tuple[int, int], int] = {}
+                for ch_id, auth_id, msg_date, cnt in daily_rows:
+                    g_id = chan_guild_map.get(ch_id, default_guild_id)
+                    key = (auth_id, g_id, msg_date)
+                    guild_daily[key] = guild_daily.get(key, 0) + cnt
+
+                    tot_key = (auth_id, g_id)
+                    guild_totals[tot_key] = guild_totals.get(tot_key, 0) + cnt
+
+                # Обновляем activity_daily
+                for (auth_id, g_id, msg_date), count in guild_daily.items():
+                    cursor.execute("""
+                        INSERT INTO activity_daily (user_id, guild_id, date, message_count, voice_seconds)
+                        VALUES (?, ?, ?, ?, 0)
+                        ON CONFLICT(user_id, guild_id, date) DO UPDATE SET message_count = MAX(message_count, ?)
+                    """, (auth_id, g_id, msg_date, count, count))
+
+                # Обновляем user_activity
+                for (auth_id, g_id), total in guild_totals.items():
+                    cursor.execute("""
+                        INSERT INTO user_activity (user_id, guild_id, message_count, voice_seconds)
+                        VALUES (?, ?, ?, 0)
+                        ON CONFLICT(user_id, guild_id) DO UPDATE SET message_count = MAX(message_count, ?)
+                    """, (auth_id, g_id, total, total))
+
+                conn.commit()
+        except Exception:
+            pass
+
     def increment_messages(self, user_id: int, guild_id: int):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         try:
@@ -522,7 +589,20 @@ class UserActivityTracker:
                 cursor.execute("SELECT COUNT(*) FROM messages WHERE author_id=?", (user_id,))
                 cached_msgs = cursor.fetchone()
                 if cached_msgs and cached_msgs[0] > msg_count:
+                    diff = cached_msgs[0] - msg_count
                     msg_count = cached_msgs[0]
+                    # Синхронизируем базу данных, чтобы топы и карточка профиля не расходились
+                    cursor.execute("""
+                        INSERT INTO user_activity (user_id, guild_id, message_count, voice_seconds)
+                        VALUES (?, ?, ?, 0)
+                        ON CONFLICT(user_id, guild_id) DO UPDATE SET message_count = MAX(message_count, ?)
+                    """, (user_id, guild_id, msg_count, msg_count))
+                    cursor.execute("""
+                        INSERT INTO activity_daily (user_id, guild_id, date, message_count, voice_seconds)
+                        VALUES (?, ?, ?, ?, 0)
+                        ON CONFLICT(user_id, guild_id, date) DO UPDATE SET message_count = message_count + ?
+                    """, (user_id, guild_id, today_str, diff, diff))
+                    conn.commit()
         except Exception:
             today_exists = False
 
@@ -585,6 +665,9 @@ class UserProfileCog(commands.Cog):
                 for member in voice_channel.members:
                     if not member.bot and member.id not in tracker._active_voice:
                         tracker.voice_join(member.id, guild.id)
+
+        # Синхронизируем счетчики сообщений с кэшем сообщений
+        tracker.sync_message_counts(self.bot)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):

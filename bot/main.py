@@ -126,6 +126,11 @@ async def preload_history(bot: commands.Bot):
                 except Exception:
                     pass
     logger.info(f"💾 Предзагружено недавних сообщений из каналов: {loaded} (Всего в базе данных: {message_cache.get_count()})")
+    try:
+        from bot.cogs.user_profile import tracker
+        tracker.sync_message_counts(bot)
+    except Exception as e:
+        logger.warning(f"Ошибка синхронизации счетчиков сообщений: {e}")
 
 
 async def main():
