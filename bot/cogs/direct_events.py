@@ -40,7 +40,7 @@ class DirectEventsCog(commands.Cog):
     # =========================================================================
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.guild:
+        if message.guild and not message.author.bot:
             message_cache.add(message)
 
     # =========================================================================

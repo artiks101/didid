@@ -65,7 +65,11 @@ async def build_voice_top_card(guild: Optional[discord.Guild], period: str = "we
             nonce = int(now * 1000)
             return discord.File(io.BytesIO(cached_bytes), filename=f"voice_top_{period}_{nonce}.{ext}")
 
-    top_data = tracker.get_top_voice(guild_id, period=period, limit=10)
+    bot_ids = {m.id for m in guild.members if m.bot} if guild else set()
+    if guild and guild.me:
+        bot_ids.add(guild.me.id)
+
+    top_data = tracker.get_top_voice(guild_id, period=period, limit=10, exclude_user_ids=bot_ids)
     period_labels = {
         "week": "За неделю",
         "month": "За месяц",
@@ -78,6 +82,8 @@ async def build_voice_top_card(guild: Optional[discord.Guild], period: str = "we
     members = []
     for user_id, secs in top_data:
         m = guild.get_member(user_id) if guild else None
+        if m and m.bot:
+            continue
         members.append((user_id, m, secs))
         fetch_tasks.append(_fetch_member_avatar_bytes(m))
 
@@ -128,7 +134,11 @@ async def build_messages_top_card(guild: Optional[discord.Guild], period: str = 
             nonce = int(now * 1000)
             return discord.File(io.BytesIO(cached_bytes), filename=f"msgs_top_{period}_{nonce}.{ext}")
 
-    top_data = tracker.get_top_messages(guild_id, period=period, limit=10)
+    bot_ids = {m.id for m in guild.members if m.bot} if guild else set()
+    if guild and guild.me:
+        bot_ids.add(guild.me.id)
+
+    top_data = tracker.get_top_messages(guild_id, period=period, limit=10, exclude_user_ids=bot_ids)
     period_labels = {
         "week": "За неделю",
         "month": "За месяц",
@@ -141,6 +151,8 @@ async def build_messages_top_card(guild: Optional[discord.Guild], period: str = 
     members = []
     for user_id, count in top_data:
         m = guild.get_member(user_id) if guild else None
+        if m and m.bot:
+            continue
         members.append((user_id, m, count))
         fetch_tasks.append(_fetch_member_avatar_bytes(m))
 
@@ -179,7 +191,11 @@ async def build_messages_top_card(guild: Optional[discord.Guild], period: str = 
 
 def build_voice_top_embed(guild: Optional[discord.Guild], period: str = "week") -> discord.Embed:
     guild_id = guild.id if guild else 0
-    top_data = tracker.get_top_voice(guild_id, period=period, limit=10)
+    bot_ids = {m.id for m in guild.members if m.bot} if guild else set()
+    if guild and guild.me:
+        bot_ids.add(guild.me.id)
+
+    top_data = tracker.get_top_voice(guild_id, period=period, limit=10, exclude_user_ids=bot_ids)
 
     period_labels = {
         "week": "За неделю (последние 7 дней)",
@@ -210,7 +226,11 @@ def build_voice_top_embed(guild: Optional[discord.Guild], period: str = "week") 
 
 def build_messages_top_embed(guild: Optional[discord.Guild], period: str = "week") -> discord.Embed:
     guild_id = guild.id if guild else 0
-    top_data = tracker.get_top_messages(guild_id, period=period, limit=10)
+    bot_ids = {m.id for m in guild.members if m.bot} if guild else set()
+    if guild and guild.me:
+        bot_ids.add(guild.me.id)
+
+    top_data = tracker.get_top_messages(guild_id, period=period, limit=10, exclude_user_ids=bot_ids)
 
     period_labels = {
         "week": "За неделю (последние 7 дней)",
@@ -633,8 +653,12 @@ class LeaderboardsCog(commands.Cog):
             else:
                 target_month = now.strftime("%Y-%m")
 
-        voice_top = tracker.get_top_voice(guild.id, limit=5, month_str=target_month)
-        chat_top = tracker.get_top_messages(guild.id, limit=5, month_str=target_month)
+        bot_ids = {m.id for m in guild.members if m.bot}
+        if guild.me:
+            bot_ids.add(guild.me.id)
+
+        voice_top = tracker.get_top_voice(guild.id, limit=5, month_str=target_month, exclude_user_ids=bot_ids)
+        chat_top = tracker.get_top_messages(guild.id, limit=5, month_str=target_month, exclude_user_ids=bot_ids)
 
         if not voice_top and not chat_top:
             return False, f"Нет данных активности за месяц `{target_month}`.", None
@@ -815,6 +839,7 @@ class LeaderboardsCog(commands.Cog):
         self.bot.add_view(VoiceTopView("week"))
         self.bot.add_view(MessagesTopView("week"))
         tracker.sync_message_counts(self.bot)
+        _TOP_CARD_CACHE.clear()
         for guild in self.bot.guilds:
             asyncio.create_task(self.precache_all_periods(guild))
 

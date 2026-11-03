@@ -29,6 +29,65 @@ def is_afk_channel(channel: Optional[Union[discord.VoiceChannel, discord.StageCh
     return False
 
 
+def is_bot_command_message(content: str, bot_ids: Optional[set[int]] = None) -> bool:
+    """
+    Определяет, является ли сообщение вызовом команды бота.
+    Команды ботов не учитываются в статистике и топах текстовой активности.
+    """
+    if not content:
+        return False
+    s = content.strip()
+    if not s:
+        return False
+
+    # 1. Прямое упоминание бота в начале сообщения: <@123456> или <@!123456>
+    if s.startswith("<@"):
+        end_idx = s.find(">")
+        if end_idx != -1:
+            mention_part = s[2:end_idx].lstrip("!")
+            if mention_part.isdigit():
+                uid = int(mention_part)
+                if bot_ids and uid in bot_ids:
+                    return True
+                after = s[end_idx + 1:].strip()
+                if after and (bot_ids is None or uid in bot_ids):
+                    return True
+
+    # 2. Слэш-команды (/command)
+    if s.startswith("/"):
+        if len(s) > 1 and (s[1].isalnum() or s[1] in ("/", "?")):
+            return True
+
+    # 3. Префикс ! (!play, !me, !help, !!)
+    if s.startswith("!"):
+        if len(s) > 1 and (s[1].isalnum() or s[1] in ("!", "?", "$")):
+            return True
+
+    # 4. Префикс . (точка) - исключаем многоточие ("...", "..")
+    if s.startswith("."):
+        if len(s) > 1 and s[1].isalpha():
+            return True
+
+    # 5. Префиксы $, %, ~, ;, ,
+    if s.startswith(("$", "%", "~", ";", ",")):
+        first_char = s[0]
+        rest = s.lstrip(first_char)
+        if rest and (rest[0].isalnum() or rest[0] in ("!", "?")):
+            return True
+
+    # 6. Префиксы - и + (исключаем прямую речь "- привет" и согласие "+", "+1")
+    if s.startswith(("-", "+")):
+        if len(s) > 1 and s[1].isalpha():
+            return True
+
+    # 7. Префикс ? (вопросительный знак) - исключаем обычные знаки вопроса "?", "???"
+    if s.startswith("?"):
+        if len(s) > 1 and s[1].isalpha():
+            return True
+
+    return False
+
+
 def format_voice_duration(seconds: float) -> str:
     """Форматирует секунды голосового чата в читаемый вид (часы, минуты, секунды)."""
     secs = int(seconds)
@@ -174,7 +233,9 @@ class UserActivityTracker:
     def sync_message_counts(self, bot: Optional[commands.Bot] = None):
         """
         Синхронизирует счетчики сообщений между кэшем messages и таблицами user_activity / activity_daily.
-        Гарантирует единый источник правды: в профиле (/me) и в топах всегда отображается одинаковое число сообщений.
+        - Исключает ботов (никогда не попадают в топ).
+        - Исключает команды к ботам (!, /, ., $, ?, -, +, ~, ;, и т.д.).
+        - Гарантирует единый источник правды: в профиле (/me) и в топах всегда отображается одинаковое число сообщений.
         """
         try:
             with sqlite3.connect(self.db_path, timeout=10.0) as conn:
@@ -186,50 +247,67 @@ class UserActivityTracker:
                 if not cursor.fetchone():
                     return
 
-                # Карта channel_id -> guild_id
+                # Собираем список ID всех ботов
+                bot_ids: set[int] = set()
                 chan_guild_map: dict[int, int] = {}
                 default_guild_id = Config.GUILD_ID or 0
                 if bot:
+                    if bot.user:
+                        bot_ids.add(bot.user.id)
                     for g in bot.guilds:
                         if not default_guild_id:
                             default_guild_id = g.id
+                        for m in g.members:
+                            if m.bot:
+                                bot_ids.add(m.id)
                         for ch in g.channels:
                             chan_guild_map[ch.id] = g.id
 
-                # 1. Посуточная синхронизация по (channel_id, author_id, date)
+                # Удаляем всех ботов из таблиц активности (боты никогда не должны быть в топах)
+                if bot_ids:
+                    placeholders = ",".join("?" for _ in bot_ids)
+                    conn.execute(f"DELETE FROM user_activity WHERE user_id IN ({placeholders})", list(bot_ids))
+                    conn.execute(f"DELETE FROM activity_daily WHERE user_id IN ({placeholders})", list(bot_ids))
+
+                # Считываем сообщения из кэша
                 cursor.execute("""
-                    SELECT channel_id, author_id, strftime('%Y-%m-%d', created_at, 'unixepoch') as msg_date, COUNT(*) as cnt
+                    SELECT channel_id, author_id, content, strftime('%Y-%m-%d', created_at, 'unixepoch') as msg_date
                     FROM messages
                     WHERE author_id IS NOT NULL AND created_at IS NOT NULL
-                    GROUP BY channel_id, author_id, msg_date
                 """)
-                daily_rows = cursor.fetchall()
+                rows = cursor.fetchall()
 
-                # Агрегируем по (guild_id, author_id, msg_date) и (guild_id, author_id)
+                # Агрегируем только реальные сообщения от людей (без команд ботам)
                 guild_daily: dict[tuple[int, int, str], int] = {}
                 guild_totals: dict[tuple[int, int], int] = {}
-                for ch_id, auth_id, msg_date, cnt in daily_rows:
+
+                for ch_id, auth_id, content, msg_date in rows:
+                    if auth_id in bot_ids:
+                        continue
+                    if is_bot_command_message(content, bot_ids):
+                        continue
+
                     g_id = chan_guild_map.get(ch_id, default_guild_id)
                     key = (auth_id, g_id, msg_date)
-                    guild_daily[key] = guild_daily.get(key, 0) + cnt
+                    guild_daily[key] = guild_daily.get(key, 0) + 1
 
                     tot_key = (auth_id, g_id)
-                    guild_totals[tot_key] = guild_totals.get(tot_key, 0) + cnt
+                    guild_totals[tot_key] = guild_totals.get(tot_key, 0) + 1
 
-                # Обновляем activity_daily
+                # Обновляем activity_daily для людей
                 for (auth_id, g_id, msg_date), count in guild_daily.items():
                     cursor.execute("""
                         INSERT INTO activity_daily (user_id, guild_id, date, message_count, voice_seconds)
                         VALUES (?, ?, ?, ?, 0)
-                        ON CONFLICT(user_id, guild_id, date) DO UPDATE SET message_count = MAX(message_count, ?)
+                        ON CONFLICT(user_id, guild_id, date) DO UPDATE SET message_count = ?
                     """, (auth_id, g_id, msg_date, count, count))
 
-                # Обновляем user_activity
+                # Обновляем user_activity для людей
                 for (auth_id, g_id), total in guild_totals.items():
                     cursor.execute("""
                         INSERT INTO user_activity (user_id, guild_id, message_count, voice_seconds)
                         VALUES (?, ?, ?, 0)
-                        ON CONFLICT(user_id, guild_id) DO UPDATE SET message_count = MAX(message_count, ?)
+                        ON CONFLICT(user_id, guild_id) DO UPDATE SET message_count = ?
                     """, (auth_id, g_id, total, total))
 
                 conn.commit()
@@ -362,14 +440,16 @@ class UserActivityTracker:
         except Exception:
             pass
 
-    def get_top_voice(self, guild_id: int, period: str = "week", limit: int = 10, month_str: Optional[str] = None) -> list[tuple[int, float]]:
+    def get_top_voice(self, guild_id: int, period: str = "week", limit: int = 10, month_str: Optional[str] = None, exclude_user_ids: Optional[set[int]] = None) -> list[tuple[int, float]]:
         """
         Возвращает топ участников по голосовому времени: [(user_id, voice_seconds), ...]
         period: 'week' (7 дней), 'month' (30 дней), 'all' (всё время)
         month_str: если указан (например '2026-10'), фильтрует строго по этому календарному месяцу
+        exclude_user_ids: список ID для исключения (например, боты)
         """
         self.flush_all()
         results = []
+        fetch_limit = limit + (len(exclude_user_ids) if exclude_user_ids else 0) + 15
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -382,7 +462,7 @@ class UserActivityTracker:
                         HAVING total > 0
                         ORDER BY total DESC
                         LIMIT ?
-                    """, (guild_id, month_str, limit))
+                    """, (guild_id, month_str, fetch_limit))
                 elif period == "week":
                     cursor.execute("""
                         SELECT user_id, SUM(voice_seconds) as total
@@ -392,7 +472,7 @@ class UserActivityTracker:
                         HAVING total > 0
                         ORDER BY total DESC
                         LIMIT ?
-                    """, (guild_id, limit))
+                    """, (guild_id, fetch_limit))
                 elif period == "month":
                     cursor.execute("""
                         SELECT user_id, SUM(voice_seconds) as total
@@ -402,7 +482,7 @@ class UserActivityTracker:
                         HAVING total > 0
                         ORDER BY total DESC
                         LIMIT ?
-                    """, (guild_id, limit))
+                    """, (guild_id, fetch_limit))
                 else:  # all
                     cursor.execute("""
                         SELECT user_id, voice_seconds as total
@@ -410,19 +490,25 @@ class UserActivityTracker:
                         WHERE guild_id = ? AND voice_seconds > 0
                         ORDER BY total DESC
                         LIMIT ?
-                    """, (guild_id, limit))
-                results = cursor.fetchall()
+                    """, (guild_id, fetch_limit))
+                raw_results = cursor.fetchall()
+                if exclude_user_ids:
+                    results = [r for r in raw_results if r[0] not in exclude_user_ids][:limit]
+                else:
+                    results = raw_results[:limit]
         except Exception:
             pass
         return results
 
-    def get_top_messages(self, guild_id: int, period: str = "week", limit: int = 10, month_str: Optional[str] = None) -> list[tuple[int, int]]:
+    def get_top_messages(self, guild_id: int, period: str = "week", limit: int = 10, month_str: Optional[str] = None, exclude_user_ids: Optional[set[int]] = None) -> list[tuple[int, int]]:
         """
         Возвращает топ участников по сообщениям: [(user_id, message_count), ...]
         period: 'week' (7 дней), 'month' (30 дней), 'all' (всё время)
         month_str: если указан (например '2026-10'), фильтрует строго по этому календарному месяцу
+        exclude_user_ids: список ID для исключения (например, боты)
         """
         results = []
+        fetch_limit = limit + (len(exclude_user_ids) if exclude_user_ids else 0) + 15
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -435,7 +521,7 @@ class UserActivityTracker:
                         HAVING total > 0
                         ORDER BY total DESC
                         LIMIT ?
-                    """, (guild_id, month_str, limit))
+                    """, (guild_id, month_str, fetch_limit))
                 elif period == "week":
                     cursor.execute("""
                         SELECT user_id, SUM(message_count) as total
@@ -445,7 +531,7 @@ class UserActivityTracker:
                         HAVING total > 0
                         ORDER BY total DESC
                         LIMIT ?
-                    """, (guild_id, limit))
+                    """, (guild_id, fetch_limit))
                 elif period == "month":
                     cursor.execute("""
                         SELECT user_id, SUM(message_count) as total
@@ -455,7 +541,7 @@ class UserActivityTracker:
                         HAVING total > 0
                         ORDER BY total DESC
                         LIMIT ?
-                    """, (guild_id, limit))
+                    """, (guild_id, fetch_limit))
                 else:  # all
                     cursor.execute("""
                         SELECT user_id, message_count as total
@@ -463,8 +549,12 @@ class UserActivityTracker:
                         WHERE guild_id = ? AND message_count > 0
                         ORDER BY total DESC
                         LIMIT ?
-                    """, (guild_id, limit))
-                results = cursor.fetchall()
+                    """, (guild_id, fetch_limit))
+                raw_results = cursor.fetchall()
+                if exclude_user_ids:
+                    results = [r for r in raw_results if r[0] not in exclude_user_ids][:limit]
+                else:
+                    results = raw_results[:limit]
         except Exception:
             pass
         return results
@@ -585,24 +675,26 @@ class UserActivityTracker:
                 )
                 today_exists = cursor.fetchone() is not None
 
-                # Проверяем также сообщения в таблице messages
-                cursor.execute("SELECT COUNT(*) FROM messages WHERE author_id=?", (user_id,))
-                cached_msgs = cursor.fetchone()
-                if cached_msgs and cached_msgs[0] > msg_count:
-                    diff = cached_msgs[0] - msg_count
-                    msg_count = cached_msgs[0]
-                    # Синхронизируем базу данных, чтобы топы и карточка профиля не расходились
-                    cursor.execute("""
-                        INSERT INTO user_activity (user_id, guild_id, message_count, voice_seconds)
-                        VALUES (?, ?, ?, 0)
-                        ON CONFLICT(user_id, guild_id) DO UPDATE SET message_count = MAX(message_count, ?)
-                    """, (user_id, guild_id, msg_count, msg_count))
-                    cursor.execute("""
-                        INSERT INTO activity_daily (user_id, guild_id, date, message_count, voice_seconds)
-                        VALUES (?, ?, ?, ?, 0)
-                        ON CONFLICT(user_id, guild_id, date) DO UPDATE SET message_count = message_count + ?
-                    """, (user_id, guild_id, today_str, diff, diff))
-                    conn.commit()
+                # Проверяем также сообщения в таблице messages (исключая команды к ботам)
+                cursor.execute("SELECT content FROM messages WHERE author_id=?", (user_id,))
+                user_msgs = cursor.fetchall()
+                if user_msgs:
+                    valid_cnt = sum(1 for (cnt_text,) in user_msgs if not is_bot_command_message(cnt_text))
+                    if valid_cnt > msg_count:
+                        diff = valid_cnt - msg_count
+                        msg_count = valid_cnt
+                        # Синхронизируем базу данных, чтобы топы и карточка профиля не расходились
+                        cursor.execute("""
+                            INSERT INTO user_activity (user_id, guild_id, message_count, voice_seconds)
+                            VALUES (?, ?, ?, 0)
+                            ON CONFLICT(user_id, guild_id) DO UPDATE SET message_count = MAX(message_count, ?)
+                        """, (user_id, guild_id, msg_count, msg_count))
+                        cursor.execute("""
+                            INSERT INTO activity_daily (user_id, guild_id, date, message_count, voice_seconds)
+                            VALUES (?, ?, ?, ?, 0)
+                            ON CONFLICT(user_id, guild_id, date) DO UPDATE SET message_count = message_count + ?
+                        """, (user_id, guild_id, today_str, diff, diff))
+                        conn.commit()
         except Exception:
             today_exists = False
 
@@ -673,49 +765,58 @@ class UserProfileCog(commands.Cog):
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
             return
-        tracker.increment_messages(message.author.id, message.guild.id)
 
-        # Резервный текстовый триггер /me или !me (с поддержкой ника/упоминания)
         content = message.content.strip()
-        lower = content.lower()
-        if lower.startswith(("/me", "!me", ".me")):
-            parts = content.split(maxsplit=1)
-            target = message.author
-            if len(parts) > 1 and message.guild:
-                query = parts[1].strip()
-                if message.mentions:
-                    target = message.mentions[0]
+        bot_ids = {m.id for m in message.guild.members if m.bot}
+        if self.bot.user:
+            bot_ids.add(self.bot.user.id)
+
+        # Команды к ботам (!play, !me, /me, .help, $roll и т.д.) не считаются сообщениями для топа
+        if is_bot_command_message(content, bot_ids):
+            # Резервный текстовый триггер /me или !me (с поддержкой ника/упоминания)
+            lower = content.lower()
+            if lower.startswith(("/me", "!me", ".me")):
+                parts = content.split(maxsplit=1)
+                target = message.author
+                if len(parts) > 1 and message.guild:
+                    query = parts[1].strip()
+                    if message.mentions:
+                        target = message.mentions[0]
+                    else:
+                        found = discord.utils.find(
+                            lambda m: query.lower() in m.name.lower() or query.lower() in (m.nick or "").lower() or str(m.id) == query,
+                            message.guild.members
+                        )
+                        if found:
+                            target = found
+
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+
+                target_guild = target.guild if hasattr(target, "guild") and target.guild else message.guild
+                guild_id = target_guild.id if target_guild else 0
+                stats = tracker.get_stats(target.id, guild_id)
+                card_buf = await self._render_profile_card(target, stats)
+
+                if card_buf:
+                    file = discord.File(fp=card_buf, filename="profile_card.png")
+                    try:
+                        await message.author.send(file=file)
+                    except Exception:
+                        file.fp.seek(0)
+                        await message.channel.send(file=file, delete_after=35)
                 else:
-                    found = discord.utils.find(
-                        lambda m: query.lower() in m.name.lower() or query.lower() in (m.nick or "").lower() or str(m.id) == query,
-                        message.guild.members
-                    )
-                    if found:
-                        target = found
+                    embed = self._build_me_embed(target, is_self=(target.id == message.author.id))
+                    try:
+                        await message.author.send(embed=embed)
+                    except Exception:
+                        await message.channel.send(embed=embed, delete_after=25)
+            return
 
-            try:
-                await message.delete()
-            except Exception:
-                pass
-
-            target_guild = target.guild if hasattr(target, "guild") and target.guild else message.guild
-            guild_id = target_guild.id if target_guild else 0
-            stats = tracker.get_stats(target.id, guild_id)
-            card_buf = await self._render_profile_card(target, stats)
-
-            if card_buf:
-                file = discord.File(fp=card_buf, filename="profile_card.png")
-                try:
-                    await message.author.send(file=file)
-                except Exception:
-                    file.fp.seek(0)
-                    await message.channel.send(file=file, delete_after=35)
-            else:
-                embed = self._build_me_embed(target, is_self=(target.id == message.author.id))
-                try:
-                    await message.author.send(embed=embed)
-                except Exception:
-                    await message.channel.send(embed=embed, delete_after=25)
+        # Учитываем только реальные сообщения людей
+        tracker.increment_messages(message.author.id, message.guild.id)
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
