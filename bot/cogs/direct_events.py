@@ -156,19 +156,30 @@ class DirectEventsCog(commands.Cog):
             if formatted_nick != after.nick:
                 guild = after.guild
                 bot_member = guild.me if guild else None
-                if bot_member and bot_member.guild_permissions.manage_nicknames:
-                    # Бот не может менять ник владельцу сервера или тем, чья роль выше/равна роли бота
-                    if after.id != guild.owner_id and bot_member.top_role > after.top_role:
-                        try:
-                            await after.edit(
-                                nick=formatted_nick,
-                                reason="Автоматический шрифт Small Capital для никнейма"
-                            )
-                            logger.info(f"✨ Никнейм участника {after} преобразован в Small Capital: '{after.nick}' -> '{formatted_nick}'")
-                        except discord.Forbidden:
-                            logger.warning(f"Недостаточно прав для изменения ника {after}")
-                        except Exception as e:
-                            logger.warning(f"Ошибка при смене ника {after}: {e}")
+                if not bot_member:
+                    return
+
+                if not (bot_member.guild_permissions.manage_nicknames or bot_member.guild_permissions.administrator):
+                    logger.warning(f"⚠️ Бот не имеет права 'Управлять никнеймами' на сервере '{guild.name}' для изменения ника {after}")
+                elif after.id == guild.owner_id:
+                    logger.info(f"ℹ️ Пропуск изменения ника владельца сервера {after} (ограничение Discord API)")
+                elif bot_member.top_role <= after.top_role:
+                    logger.warning(
+                        f"⚠️ Невозможно изменить ник {after}: роль бота '{bot_member.top_role.name}' "
+                        f"находится ниже или равна роли участника '{after.top_role.name}'. "
+                        f"Поднимите роль бота выше в Настройках сервера -> Роли."
+                    )
+                else:
+                    try:
+                        await after.edit(
+                            nick=formatted_nick,
+                            reason="Автоматический шрифт Small Capital для никнейма"
+                        )
+                        logger.info(f"✨ Никнейм участника {after} преобразован в Small Capital: '{after.nick}' -> '{formatted_nick}'")
+                    except discord.Forbidden:
+                        logger.warning(f"❌ Discord запретил смену ника {after} (403 Forbidden - проверьте иерархию ролей)")
+                    except Exception as e:
+                        logger.warning(f"Ошибка при смене ника {after}: {e}")
 
         log_channel = self._get_log_channel(before.guild)
         if not log_channel:
@@ -215,7 +226,7 @@ class DirectEventsCog(commands.Cog):
             return
 
         bot_member = guild.me
-        if not (bot_member and bot_member.guild_permissions.manage_channels):
+        if not (bot_member and (bot_member.guild_permissions.manage_channels or bot_member.guild_permissions.administrator)):
             return
 
         name = channel.name
@@ -242,7 +253,7 @@ class DirectEventsCog(commands.Cog):
             return
 
         bot_member = guild.me
-        if not (bot_member and bot_member.guild_permissions.manage_channels):
+        if not (bot_member and (bot_member.guild_permissions.manage_channels or bot_member.guild_permissions.administrator)):
             return
 
         name = after.name
