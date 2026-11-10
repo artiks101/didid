@@ -14,6 +14,7 @@ from bot.utils import (
     get_actor_role_label,
     message_cache,
     ShowMessageContentView,
+    to_small_caps,
 )
 
 logger = logging.getLogger("bot.cogs.direct_events")
@@ -142,12 +143,32 @@ class DirectEventsCog(commands.Cog):
             logger.exception(f"Ошибка при отправке лога удаления сообщения: {e}")
 
     # =========================================================================
-    # 3. Критическое событие: получение или потеря прав Администратора
+    # 3. Никнеймы и критическое событие: статус прав Администратора
     # =========================================================================
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         if not before.guild:
             return
+
+        # Автоматическое форматирование ника в шрифт Small Capital при смене
+        if before.nick != after.nick and after.nick:
+            formatted_nick = to_small_caps(after.nick)[:32]
+            if formatted_nick != after.nick:
+                guild = after.guild
+                bot_member = guild.me if guild else None
+                if bot_member and bot_member.guild_permissions.manage_nicknames:
+                    # Бот не может менять ник владельцу сервера или тем, чья роль выше/равна роли бота
+                    if after.id != guild.owner_id and bot_member.top_role > after.top_role:
+                        try:
+                            await after.edit(
+                                nick=formatted_nick,
+                                reason="Автоматический шрифт Small Capital для никнейма"
+                            )
+                            logger.info(f"✨ Никнейм участника {after} преобразован в Small Capital: '{after.nick}' -> '{formatted_nick}'")
+                        except discord.Forbidden:
+                            logger.warning(f"Недостаточно прав для изменения ника {after}")
+                        except Exception as e:
+                            logger.warning(f"Ошибка при смене ника {after}: {e}")
 
         log_channel = self._get_log_channel(before.guild)
         if not log_channel:
@@ -183,6 +204,60 @@ class DirectEventsCog(commands.Cog):
                 guild=before.guild,
             )
             await log_channel.send(embed=embed)
+
+    # =========================================================================
+    # 4. Автоматическое форматирование названий каналов в шрифт Small Capital
+    # =========================================================================
+    @commands.Cog.listener()
+    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
+        guild = channel.guild
+        if not guild:
+            return
+
+        bot_member = guild.me
+        if not (bot_member and bot_member.guild_permissions.manage_channels):
+            return
+
+        name = channel.name
+        formatted_name = to_small_caps(name)[:100]
+        if formatted_name != name:
+            try:
+                await channel.edit(
+                    name=formatted_name,
+                    reason="Автоматический шрифт Small Capital для названия канала"
+                )
+                logger.info(f"📁 Название канала #{name} преобразовано в Small Capital: '{formatted_name}'")
+            except discord.Forbidden:
+                logger.warning(f"Недостаточно прав для изменения названия канала #{name}")
+            except Exception as e:
+                logger.warning(f"Ошибка при форматировании названия канала #{name}: {e}")
+
+    @commands.Cog.listener()
+    async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
+        if before.name == after.name:
+            return
+
+        guild = after.guild
+        if not guild:
+            return
+
+        bot_member = guild.me
+        if not (bot_member and bot_member.guild_permissions.manage_channels):
+            return
+
+        name = after.name
+        formatted_name = to_small_caps(name)[:100]
+        if formatted_name != name:
+            try:
+                await after.edit(
+                    name=formatted_name,
+                    reason="Автоматический шрифт Small Capital для названия канала"
+                )
+                logger.info(f"📁 Название обновленного канала #{name} преобразовано в Small Capital: '{formatted_name}'")
+            except discord.Forbidden:
+                logger.warning(f"Недостаточно прав для изменения названия канала #{name}")
+            except Exception as e:
+                logger.warning(f"Ошибка при форматировании названия канала #{name}: {e}")
 
 
 async def setup(bot: commands.Bot):
