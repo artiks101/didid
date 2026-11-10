@@ -107,7 +107,10 @@ class AuditLogsCog(commands.Cog):
         if not log_channel:
             return
 
-        actor = entry.user
+        try:
+            actor = entry.user
+        except Exception:
+            actor = None
         if actor and actor.bot and not Config.LOG_BOTS:
             return
 
@@ -142,7 +145,11 @@ class AuditLogsCog(commands.Cog):
             ):
                 return
 
-        embed, view = await self._create_audit_embed(entry)
+        try:
+            embed, view = await self._create_audit_embed(entry)
+        except Exception as e:
+            logger.warning(f"Ошибка при обработке записи аудита {getattr(entry, 'action', 'unknown')}: {e}")
+            return
         if embed:
             try:
                 if view:
@@ -158,10 +165,33 @@ class AuditLogsCog(commands.Cog):
         self, entry: discord.AuditLogEntry
     ) -> Tuple[Optional[discord.Embed], Optional[discord.ui.View]]:
         action = entry.action
-        actor = entry.user
-        target = entry.target
-        reason = entry.reason
         guild = entry.guild
+
+        try:
+            actor = entry.user
+        except Exception:
+            actor = None
+
+        try:
+            target = entry.target
+        except Exception:
+            # Обход бага discord.py при пустом/неразрешимом target_id в audit_logs.py (Object(id=None))
+            target_id = getattr(entry, "_target_id", None)
+            if target_id is not None and guild:
+                try:
+                    tid = int(target_id)
+                    target = (
+                        guild.get_channel(tid)
+                        or guild.get_member(tid)
+                        or guild.get_role(tid)
+                        or discord.Object(id=tid)
+                    )
+                except Exception:
+                    target = None
+            else:
+                target = None
+
+        reason = getattr(entry, "reason", None)
         actor_label = get_actor_role_label(actor, guild)
 
         # ----------------------------------------------------------------------
