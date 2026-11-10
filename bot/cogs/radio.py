@@ -12,25 +12,25 @@ logger = logging.getLogger("bot.cogs.radio")
 RADIO_STATIONS = {
     "record": {
         "name": "Radio Record",
-        "url": "https://air.radiorecord.ru/rr_320",
+        "url": "https://radiorecord.hostingradio.ru/rr_main96.aacp",
         "description": "Электронная танцевальная музыка №1",
         "emoji": "📻",
     },
     "deep": {
         "name": "Record Deep",
-        "url": "https://air.radiorecord.ru/deep_320",
+        "url": "https://radiorecord.hostingradio.ru/deep96.aacp",
         "description": "Атмосферный и глубокий House & Deep",
         "emoji": "🌊",
     },
     "chill": {
         "name": "Record Chill-Out",
-        "url": "https://air.radiorecord.ru/chil_320",
+        "url": "https://radiorecord.hostingradio.ru/chil96.aacp",
         "description": "Расслабляющая и спокойная музыка для отдыха",
         "emoji": "☕",
     },
     "russian": {
         "name": "Record Russian Hits",
-        "url": "https://air.radiorecord.ru/rus_320",
+        "url": "https://radiorecord.hostingradio.ru/rus96.aacp",
         "description": "Лучшие танцевальные хиты на русском",
         "emoji": "🇷🇺",
     },
@@ -47,8 +47,8 @@ RADIO_STATIONS = {
         "emoji": "🔥",
     },
     "lofi": {
-        "name": "Lofi Chill Radio",
-        "url": "https://stream.zeno.fm/f3wvbbqmdg8uv",
+        "name": "Record Lofi Chill",
+        "url": "https://radiorecord.hostingradio.ru/lofi96.aacp",
         "description": "Lofi Hip Hop биты для работы, учебы и отдыха",
         "emoji": "🎧",
     },
@@ -271,7 +271,7 @@ class RadioCog(commands.Cog):
 
     def _create_audio_source(self, url: str, volume: float) -> discord.PCMVolumeTransformer:
         ffmpeg_opts = {
-            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -user_agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'",
             "options": "-vn",
         }
         source = discord.FFmpegPCMAudio(url, **ffmpeg_opts)
