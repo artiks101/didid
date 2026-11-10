@@ -149,6 +149,7 @@ async def main():
         "bot.cogs.status",
         "bot.cogs.user_profile",
         "bot.cogs.leaderboards",
+        "bot.cogs.radio",
     ]
 
     for ext in initial_extensions:
