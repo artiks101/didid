@@ -796,13 +796,27 @@ class LeaderboardsCog(commands.Cog):
 
         embed.set_footer(text=f"Награды выданы • Роли действуют до конца следующего месяца")
 
-        # Отправляем в канал топов
-        top_channel = self.bot.get_channel(Config.TOP_CHANNEL_ID)
-        if isinstance(top_channel, discord.TextChannel):
+        # 1. Отправляем официальное объявление с @everyone в канал объявлений победителей
+        notify_channel = self.bot.get_channel(Config.REWARDS_NOTIFICATION_CHANNEL_ID)
+        if isinstance(notify_channel, discord.TextChannel):
             try:
-                await top_channel.send(embed=embed)
-            except Exception:
-                pass
+                await notify_channel.send(
+                    content="@everyone",
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(everyone=True)
+                )
+                logger.info(f"🎉 Уведомление о победителях с @everyone отправлено в #{notify_channel.name} ({notify_channel.id})")
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление о победителях в #{notify_channel.id}: {e}")
+
+        # 2. Также отправляем в канал топов (если он отличается)
+        if Config.TOP_CHANNEL_ID != Config.REWARDS_NOTIFICATION_CHANNEL_ID:
+            top_channel = self.bot.get_channel(Config.TOP_CHANNEL_ID)
+            if isinstance(top_channel, discord.TextChannel):
+                try:
+                    await top_channel.send(embed=embed)
+                except Exception:
+                    pass
 
         return True, f"Награды за `{target_month}` успешно распределены!", embed
 

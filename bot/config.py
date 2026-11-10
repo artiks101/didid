@@ -25,6 +25,13 @@ class Config:
     except ValueError:
         TOP_CHANNEL_ID: int = 1566474940465680604
 
+    # ID канала для объявления победителей топов месяца с @everyone
+    raw_rewards_channel_id = os.getenv("REWARDS_NOTIFICATION_CHANNEL_ID", "1479104437954936912").strip()
+    try:
+        REWARDS_NOTIFICATION_CHANNEL_ID: int = int(raw_rewards_channel_id) if raw_rewards_channel_id else 1479104437954936912
+    except ValueError:
+        REWARDS_NOTIFICATION_CHANNEL_ID: int = 1479104437954936912
+
     # Роли за победу в топах месяца (Топ-1 войс и Топ-1 чат)
     raw_voice_role = os.getenv("VOICE_TOP_ROLE_ID", "1566478706422190141").strip()
     try:
