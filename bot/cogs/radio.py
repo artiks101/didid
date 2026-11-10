@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import re
 from typing import Dict, Optional
 
 import discord
@@ -129,6 +128,13 @@ class RadioStationSelect(discord.ui.Select):
         if not cog:
             return await interaction.response.send_message("❌ Модуль радио недоступен", ephemeral=True)
 
+        vc = interaction.guild.voice_client
+        if vc and vc.channel and interaction.user not in vc.channel.members:
+            return await interaction.response.send_message(
+                "⚠️ Переключать станцию могут только участники в этом голосовом канале!",
+                ephemeral=True,
+            )
+
         selected_key = self.values[0]
         await interaction.response.defer()
         await cog.change_station(interaction.guild, selected_key, interaction=interaction)
@@ -152,11 +158,23 @@ class RadioPlayerView(discord.ui.View):
         self.pause_button.label = pause_label
         self.pause_button.emoji = pause_emoji
 
+    def _check_user_in_voice(self, interaction: discord.Interaction) -> bool:
+        vc = interaction.guild.voice_client
+        if not vc or not vc.channel:
+            return False
+        return interaction.user in vc.channel.members
+
     @discord.ui.button(label="Пауза", style=discord.ButtonStyle.secondary, emoji="⏸️", row=1)
     async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = interaction.guild.voice_client
         if not vc:
             return await interaction.response.send_message("⚠️ Бот не подключен к голосовому каналу.", ephemeral=True)
+
+        if not self._check_user_in_voice(interaction):
+            return await interaction.response.send_message(
+                "⚠️ Управлять радио могут только участники, находящиеся в этом голосовом канале!",
+                ephemeral=True,
+            )
 
         if self.state.is_paused:
             vc.resume()
@@ -175,6 +193,12 @@ class RadioPlayerView(discord.ui.View):
     @discord.ui.button(label="-10%", style=discord.ButtonStyle.primary, emoji="🔉", row=1)
     async def volume_down(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = interaction.guild.voice_client
+        if not self._check_user_in_voice(interaction):
+            return await interaction.response.send_message(
+                "⚠️ Управлять радио могут только участники, находящиеся в этом голосовом канале!",
+                ephemeral=True,
+            )
+
         new_vol = max(0.1, round(self.state.volume - 0.1, 1))
         self.state.volume = new_vol
         if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
@@ -186,6 +210,12 @@ class RadioPlayerView(discord.ui.View):
     @discord.ui.button(label="+10%", style=discord.ButtonStyle.primary, emoji="🔊", row=1)
     async def volume_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = interaction.guild.voice_client
+        if not self._check_user_in_voice(interaction):
+            return await interaction.response.send_message(
+                "⚠️ Управлять радио могут только участники, находящиеся в этом голосовом канале!",
+                ephemeral=True,
+            )
+
         new_vol = min(2.0, round(self.state.volume + 0.1, 1))
         self.state.volume = new_vol
         if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
@@ -196,7 +226,13 @@ class RadioPlayerView(discord.ui.View):
 
     @discord.ui.button(label="Отключить", style=discord.ButtonStyle.danger, emoji="⏹️", row=1)
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
+        if not self._check_user_in_voice(interaction):
+            return await interaction.response.send_message(
+                "⚠️ Отключить радио могут только участники, находящиеся в этом голосовом канале!",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True)
         await self.cog.stop_radio(interaction.guild, interaction=interaction)
 
 
@@ -218,7 +254,7 @@ class RadioCog(commands.Cog):
         member: discord.Member,
     ) -> Optional[discord.VoiceChannel | discord.StageChannel]:
         """Определяет целевой голосовой канал.
-        
+
         Если команда вызвана в текстовом чате голосового канала (VoiceChannel / StageChannel),
         подключается именно к этому каналу.
         Иначе, если пользователь находится в войсе, подключается к его каналу.
@@ -338,14 +374,22 @@ class RadioCog(commands.Cog):
             elif vc.channel.id != target_channel.id:
                 await vc.move_to(target_channel)
         except Exception as e:
+            err_str = str(e)
             logger.exception(f"Ошибка подключения к голосовому каналу {target_channel.name}: {e}")
-            msg = f"❌ Не удалось подключиться к каналу **{target_channel.name}**: {e}"
-            if interaction and not interaction.response.is_done():
-                await interaction.response.send_message(msg, ephemeral=True)
-            elif interaction:
+            if "davey" in err_str.lower() or "nacl" in err_str.lower():
+                msg = (
+                    f"❌ **Не удалось подключиться к каналу:** {e}\n\n"
+                    f"💡 *Для работы голоса в discord.py требуется библиотека `davey` и `PyNaCl`.*\n"
+                    f"Они уже добавлены в `requirements.txt`. Перезапустите бота на сервере хостинга "
+                    f"или выполните: `pip install davey PyNaCl`."
+                )
+            else:
+                msg = f"❌ Не удалось подключиться к каналу **{target_channel.name}**: {e}"
+
+            if interaction:
                 await interaction.followup.send(msg, ephemeral=True)
             else:
-                await text_channel.send(msg)
+                await text_channel.send(msg, delete_after=15)
             return
 
         # Воспроизведение потока
@@ -360,48 +404,56 @@ class RadioCog(commands.Cog):
             err_msg = str(e)
             logger.error(f"ClientException при воспроизведении радио: {err_msg}")
             msg = f"❌ Ошибка воспроизведения: {err_msg}"
-            if interaction and not interaction.response.is_done():
-                await interaction.response.send_message(msg, ephemeral=True)
-            elif interaction:
+            if interaction:
                 await interaction.followup.send(msg, ephemeral=True)
             else:
-                await text_channel.send(msg)
+                await text_channel.send(msg, delete_after=15)
             return
         except FileNotFoundError:
             msg = "❌ **FFmpeg не найден на сервере!**\nДля работы радио необходимо установить `ffmpeg` на хостинге бота."
             logger.error(msg)
-            if interaction and not interaction.response.is_done():
-                await interaction.response.send_message(msg, ephemeral=True)
-            elif interaction:
+            if interaction:
                 await interaction.followup.send(msg, ephemeral=True)
             else:
-                await text_channel.send(msg)
+                await text_channel.send(msg, delete_after=15)
             return
         except Exception as e:
             logger.exception(f"Непредвиденная ошибка воспроизведения радио: {e}")
             msg = f"❌ Ошибка запуска аудиопотока: {e}"
-            if interaction and not interaction.response.is_done():
-                await interaction.response.send_message(msg, ephemeral=True)
-            elif interaction:
+            if interaction:
                 await interaction.followup.send(msg, ephemeral=True)
             else:
-                await text_channel.send(msg)
+                await text_channel.send(msg, delete_after=15)
             return
 
-        # Отправка/обновление панели плеера
+        # ========================================================
+        # УСПЕШНЫЙ ЗАПУСК РАДИО:
+        # Только здесь отправляем публичный виджет для всех участников!
+        # ========================================================
         embed = self.build_embed(guild, state)
         view = RadioPlayerView(self, guild, state)
 
+        # Удаляем предыдущий плеер, если был
+        if state.message:
+            try:
+                await state.message.delete()
+            except Exception:
+                pass
+
         try:
-            if interaction and not interaction.response.is_done():
-                await interaction.response.send_message(embed=embed, view=view)
-                state.message = await interaction.original_response()
-            elif interaction:
-                state.message = await interaction.followup.send(embed=embed, view=view)
-            else:
-                state.message = await text_channel.send(embed=embed, view=view)
+            state.message = await text_channel.send(embed=embed, view=view)
         except Exception as e:
-            logger.warning(f"Ошибка отправки панели плеера: {e}")
+            logger.warning(f"Ошибка отправки публичной панели плеера: {e}")
+
+        # Автору команды отправляем персональный ответ (ephemeral)
+        if interaction:
+            try:
+                await interaction.followup.send(
+                    f"📻 Радио **{state.display_name}** успешно запущено в канале **{target_channel.name}**!",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
 
     async def change_station(
         self,
@@ -427,14 +479,17 @@ class RadioCog(commands.Cog):
         embed = self.build_embed(guild, state)
         view = RadioPlayerView(self, guild, state)
 
-        if interaction:
-            try:
-                await interaction.edit_original_response(embed=embed, view=view)
-            except Exception:
-                pass
-        elif state.message:
+        if state.message:
             try:
                 await state.message.edit(embed=embed, view=view)
+            except Exception:
+                pass
+
+        if interaction:
+            try:
+                await interaction.followup.send(
+                    f"📻 Станция переключена на **{state.display_name}**", ephemeral=True
+                )
             except Exception:
                 pass
 
@@ -459,14 +514,6 @@ class RadioCog(commands.Cog):
             description="⏹️ Воспроизведение остановлено. Бот отключился от голосового канала.",
             color=0xE74C3C,
         )
-        if interaction:
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(embed=embed, ephemeral=True)
-                else:
-                    await interaction.followup.send(embed=embed, ephemeral=True)
-            except Exception:
-                pass
 
         if state.message:
             try:
@@ -474,6 +521,15 @@ class RadioCog(commands.Cog):
             except Exception:
                 pass
             state.message = None
+
+        if interaction:
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("⏹️ Радио выключено.", ephemeral=True)
+                else:
+                    await interaction.followup.send("⏹️ Радио выключено.", ephemeral=True)
+            except Exception:
+                pass
 
     def _on_playback_error(self, guild: discord.Guild, error: Optional[Exception]):
         if error:
@@ -514,7 +570,8 @@ class RadioCog(commands.Cog):
                 ephemeral=True,
             )
 
-        await interaction.response.defer()
+        # Все промежуточные статусы и ошибки видит ТОЛЬКО автор команды
+        await interaction.response.defer(ephemeral=True)
         await self.play_stream(
             guild=interaction.guild,
             target_channel=target_channel,
@@ -534,6 +591,7 @@ class RadioCog(commands.Cog):
                 "⚠️ Бот в данный момент не подключен к голосовому каналу.",
                 ephemeral=True,
             )
+        await interaction.response.defer(ephemeral=True)
         await self.stop_radio(interaction.guild, interaction=interaction)
 
     # ==========================================
@@ -546,8 +604,14 @@ class RadioCog(commands.Cog):
         target_channel = self._get_target_voice_channel(ctx.channel, ctx.author)
         if not target_channel:
             return await ctx.send(
-                "⚠️ **Вы должны находиться в голосовом канале** или ввести команду прямо в текстовом чате голосового канала!"
+                "⚠️ **Вы должны находиться в голосовом канале** или ввести команду прямо в текстовом чате голосового канала!",
+                delete_after=12,
             )
+
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
 
         await self.play_stream(
             guild=ctx.guild,
@@ -561,15 +625,20 @@ class RadioCog(commands.Cog):
         """Остановить радио и выйти из голосового канала."""
         vc = ctx.guild.voice_client
         if not vc or not vc.is_connected():
-            return await ctx.send("⚠️ Бот в данный момент не подключен к голосовому каналу.")
+            return await ctx.send("⚠️ Бот в данный момент не подключен к голосовому каналу.", delete_after=10)
+
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+
         await self.stop_radio(ctx.guild)
-        await ctx.send("⏹️ Радио выключено, бот отключился от канала.")
 
     @commands.command(name="volume", aliases=["громкость", "vol"])
     async def cmd_volume(self, ctx: commands.Context, volume: int):
         """Установить громкость от 1 до 100%."""
         if volume < 1 or volume > 150:
-            return await ctx.send("⚠️ Укажите громкость от 1 до 100%.")
+            return await ctx.send("⚠️ Укажите громкость от 1 до 100%.", delete_after=10)
 
         state = self.get_state(ctx.guild.id)
         state.volume = volume / 100.0
@@ -586,7 +655,10 @@ class RadioCog(commands.Cog):
             except Exception:
                 pass
 
-        await ctx.send(f"🔊 Громкость радио установлена на **{volume}%**")
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
 
     # ==========================================
     # АВТООТКЛЮЧЕНИЕ ПРИ ПУСТОМ КАНАЛЕ
