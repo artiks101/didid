@@ -122,6 +122,15 @@ class MonitoredAudioSource(discord.AudioSource):
     def cleanup(self):
         self.original.cleanup()
 
+    @property
+    def volume(self) -> float:
+        return getattr(self.original, "volume", 1.0)
+
+    @volume.setter
+    def volume(self, val: float) -> None:
+        if hasattr(self.original, "volume"):
+            self.original.volume = val
+
 
 class GuildRadioState:
     """Хранит состояние плеера для конкретного сервера."""
@@ -252,7 +261,6 @@ class RadioPlayerView(discord.ui.View):
 
     @discord.ui.button(label="-10%", style=discord.ButtonStyle.primary, emoji="🔉", row=1)
     async def volume_down(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = interaction.guild.voice_client
         if not self._check_user_in_voice(interaction):
             return await interaction.response.send_message(
                 "⚠️ Управлять радио могут только участники, находящиеся в этом голосовом канале!",
@@ -260,16 +268,13 @@ class RadioPlayerView(discord.ui.View):
             )
 
         new_vol = max(0.1, round(self.state.volume - 0.1, 1))
-        self.state.volume = new_vol
-        if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
-            vc.source.volume = new_vol
+        self.cog.set_volume(interaction.guild, new_vol)
 
         embed = self.cog.build_embed(interaction.guild, self.state)
         await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="+10%", style=discord.ButtonStyle.primary, emoji="🔊", row=1)
     async def volume_up(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = interaction.guild.voice_client
         if not self._check_user_in_voice(interaction):
             return await interaction.response.send_message(
                 "⚠️ Управлять радио могут только участники, находящиеся в этом голосовом канале!",
@@ -277,9 +282,7 @@ class RadioPlayerView(discord.ui.View):
             )
 
         new_vol = min(2.0, round(self.state.volume + 0.1, 1))
-        self.state.volume = new_vol
-        if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
-            vc.source.volume = new_vol
+        self.cog.set_volume(interaction.guild, new_vol)
 
         embed = self.cog.build_embed(interaction.guild, self.state)
         await interaction.response.edit_message(embed=embed, view=self)
@@ -328,6 +331,18 @@ class RadioCog(commands.Cog):
         if guild_id not in self.states:
             self.states[guild_id] = GuildRadioState(guild_id)
         return self.states[guild_id]
+
+    def set_volume(self, guild: discord.Guild, volume: float) -> None:
+        """Корректно устанавливает громкость с пробросом через обертки AudioSource."""
+        state = self.get_state(guild.id)
+        state.volume = max(0.0, min(volume, 2.0))
+        vc = guild.voice_client
+        if vc and vc.source:
+            source = vc.source
+            if hasattr(source, "original"):
+                source = source.original
+            if hasattr(source, "volume"):
+                source.volume = state.volume
 
     def _get_target_voice_channel(
         self,
@@ -824,12 +839,8 @@ class RadioCog(commands.Cog):
         if volume < 1 or volume > 150:
             return await ctx.send("⚠️ Укажите громкость от 1 до 100%.", delete_after=10)
 
+        self.set_volume(ctx.guild, volume / 100.0)
         state = self.get_state(ctx.guild.id)
-        state.volume = volume / 100.0
-
-        vc = ctx.guild.voice_client
-        if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
-            vc.source.volume = state.volume
 
         if state.message:
             try:
