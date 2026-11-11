@@ -271,7 +271,7 @@ class RadioCog(commands.Cog):
 
     def _create_audio_source(self, url: str, volume: float) -> discord.PCMVolumeTransformer:
         ffmpeg_opts = {
-            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -user_agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'",
+            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -reconnect_delay_max 5",
             "options": "-vn",
         }
         source = discord.FFmpegPCMAudio(url, **ffmpeg_opts)
@@ -391,6 +391,17 @@ class RadioCog(commands.Cog):
             else:
                 await text_channel.send(msg, delete_after=15)
             return
+
+        # Ожидаем завершения голосового рукопожатия и готовности DAVE E2EE
+        for _ in range(20):
+            if vc.is_connected():
+                conn = getattr(vc, "_connection", None)
+                if conn and getattr(conn, "dave_protocol_version", 0) > 0:
+                    if getattr(conn, "can_encrypt", False):
+                        break
+                else:
+                    break
+            await asyncio.sleep(0.1)
 
         # Воспроизведение потока
         try:
