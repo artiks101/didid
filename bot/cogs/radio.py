@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import math
+import struct
 from typing import Dict, Optional
 
 import discord
@@ -8,7 +10,7 @@ from discord.ext import commands
 
 logger = logging.getLogger("bot.cogs.radio")
 
-# Список популярных качественных онлайн-радиостанций
+# Список проверенных качественных онлайн-радиостанций
 RADIO_STATIONS = {
     "record": {
         "name": "Radio Record",
@@ -34,6 +36,12 @@ RADIO_STATIONS = {
         "description": "Лучшие танцевальные хиты на русском",
         "emoji": "🇷🇺",
     },
+    "lofi": {
+        "name": "Record Lofi Chill",
+        "url": "https://radiorecord.hostingradio.ru/lofi96.aacp",
+        "description": "Lofi Hip Hop биты для работы, учебы и отдыха",
+        "emoji": "🎧",
+    },
     "europa": {
         "name": "Europa Plus",
         "url": "http://ep256.hostingradio.ru:8052/europaplus256.mp3",
@@ -46,12 +54,6 @@ RADIO_STATIONS = {
         "description": "Зажигательное клубное танцевальное радио",
         "emoji": "🔥",
     },
-    "lofi": {
-        "name": "Record Lofi Chill",
-        "url": "https://radiorecord.hostingradio.ru/lofi96.aacp",
-        "description": "Lofi Hip Hop биты для работы, учебы и отдыха",
-        "emoji": "🎧",
-    },
     "newradio": {
         "name": "Новое Радио",
         "url": "http://icecast.newradio.cdnvideo.ru/newradio3",
@@ -63,6 +65,64 @@ RADIO_STATIONS = {
 DEFAULT_STATION_KEY = "record"
 
 
+class BeepAudioSource(discord.AudioSource):
+    """Генератор чистого PCM-звука (440 Гц, нота Ля) без внешних программ и FFmpeg.
+    Идеален для мгновенной проверки слышимости бота."""
+
+    def __init__(self, duration_sec: float = 3.0, freq: float = 440.0):
+        self.sample_rate = 48000
+        self.samples_per_frame = 960  # 20ms при 48kHz
+        self.total_frames = int(duration_sec * 50)
+        self.current_frame = 0
+        self.freq = freq
+
+    def is_opus(self) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        if self.current_frame >= self.total_frames:
+            return b""
+        self.current_frame += 1
+        buf = bytearray(self.samples_per_frame * 4)
+        for i in range(self.samples_per_frame):
+            t = (self.current_frame * self.samples_per_frame + i) / self.sample_rate
+            # 16-bit PCM стерео
+            sample = int(20000 * math.sin(2 * math.pi * self.freq * t))
+            struct.pack_into("<hh", buf, i * 4, sample, sample)
+        return bytes(buf)
+
+
+class MonitoredAudioSource(discord.AudioSource):
+    """Оборачивает источник аудио для подробного мониторинга фреймов и DAVE E2EE."""
+
+    def __init__(self, original: discord.AudioSource, vc: discord.VoiceClient, station_name: str):
+        self.original = original
+        self.vc = vc
+        self.station_name = station_name
+        self.frames = 0
+
+    def is_opus(self) -> bool:
+        return self.original.is_opus()
+
+    def read(self) -> bytes:
+        data = self.original.read()
+        self.frames += 1
+        # Логируем первые 3 фрейма и затем каждые 150 фреймов (раз в 3 сек)
+        if self.frames <= 3 or (self.frames % 150 == 0):
+            conn = getattr(self.vc, "_connection", None)
+            dave_ver = getattr(conn, "dave_protocol_version", "N/A")
+            can_enc = getattr(conn, "can_encrypt", "N/A")
+            non_zero = sum(1 for b in data[:200] if b != 0)
+            logger.info(
+                f"[{self.station_name}] Фрейм #{self.frames}: длина={len(data)} байт, "
+                f"ненулевых сэмплов={non_zero}/200, DAVE_ver={dave_ver}, can_encrypt={can_enc}"
+            )
+        return data
+
+    def cleanup(self):
+        self.original.cleanup()
+
+
 class GuildRadioState:
     """Хранит состояние плеера для конкретного сервера."""
 
@@ -71,7 +131,7 @@ class GuildRadioState:
         self.station_key: str = DEFAULT_STATION_KEY
         self.custom_url: Optional[str] = None
         self.custom_name: Optional[str] = None
-        self.volume: float = 0.5  # 50%
+        self.volume: float = 1.0  # 100% громкость по умолчанию
         self.is_paused: bool = False
         self.channel_id: Optional[int] = None
         self.text_channel_id: Optional[int] = None
@@ -224,7 +284,28 @@ class RadioPlayerView(discord.ui.View):
         embed = self.cog.build_embed(interaction.guild, self.state)
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="Отключить", style=discord.ButtonStyle.danger, emoji="⏹️", row=1)
+    @discord.ui.button(label="Тест звука", style=discord.ButtonStyle.success, emoji="🔔", row=1)
+    async def test_sound_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Проигрывает громкий 3-секундный сигнал 440 Гц для моментальной проверки звука."""
+        vc = interaction.guild.voice_client
+        if not vc or not vc.is_connected():
+            return await interaction.response.send_message("⚠️ Бот не подключен к голосовому каналу.", ephemeral=True)
+
+        if not self._check_user_in_voice(interaction):
+            return await interaction.response.send_message(
+                "⚠️ Вы должны быть в том же голосовом канале!", ephemeral=True
+            )
+
+        await interaction.response.send_message(
+            "🔔 **Проигрываю 3-секундный тестовый звук (440 Гц)!**\n"
+            "• Если звука **нет**: нажмите ПКМ по боту в канале -> проверьте **«Громкость пользователя»** "
+            "(не стоит ли 0%) и снимите галочку «Заглушить».\n"
+            "• Также проверьте устройство вывода в настройках Discord.",
+            ephemeral=True,
+        )
+        await self.cog.play_test_beep(interaction.guild)
+
+    @discord.ui.button(label="Отключить", style=discord.ButtonStyle.danger, emoji="⏹️", row=2)
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self._check_user_in_voice(interaction):
             return await interaction.response.send_message(
@@ -253,29 +334,23 @@ class RadioCog(commands.Cog):
         channel: discord.abc.GuildChannel,
         member: discord.Member,
     ) -> Optional[discord.VoiceChannel | discord.StageChannel]:
-        """Определяет целевой голосовой канал.
-
-        Если команда вызвана в текстовом чате голосового канала (VoiceChannel / StageChannel),
-        подключается именно к этому каналу.
-        Иначе, если пользователь находится в войсе, подключается к его каналу.
-        """
-        # Если чат сам является голосовым каналом (встроенный чат войса в Discord)
+        """Определяет целевой голосовой канал."""
         if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
             return channel
 
-        # Иначе проверяем, находится ли пользователь в войсе
         if member.voice and member.voice.channel:
             return member.voice.channel
 
         return None
 
-    def _create_audio_source(self, url: str, volume: float) -> discord.PCMVolumeTransformer:
+    def _create_audio_source(self, url: str, volume: float, vc: discord.VoiceClient, name: str) -> discord.AudioSource:
         ffmpeg_opts = {
-            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -reconnect_delay_max 5",
+            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
             "options": "-vn",
         }
-        source = discord.FFmpegPCMAudio(url, **ffmpeg_opts)
-        return discord.PCMVolumeTransformer(source, volume=volume)
+        raw_source = discord.FFmpegPCMAudio(url, **ffmpeg_opts)
+        vol_source = discord.PCMVolumeTransformer(raw_source, volume=volume)
+        return MonitoredAudioSource(vol_source, vc, name)
 
     def build_embed(self, guild: discord.Guild, state: GuildRadioState) -> discord.Embed:
         vc = guild.voice_client
@@ -290,7 +365,6 @@ class RadioCog(commands.Cog):
         status_text = "⏸️ На паузе" if state.is_paused else "🟢 В эфире"
         vol_pct = int(round(state.volume * 100))
 
-        # Полоса громкости
         bar_len = 10
         filled = min(bar_len, max(0, int(round((state.volume / 1.0) * (bar_len / 2)))))
         bar = "▰" * filled + "▱" * (bar_len - filled)
@@ -324,7 +398,7 @@ class RadioCog(commands.Cog):
         )
 
         embed.set_footer(
-            text="Управляйте радио кнопками ниже или выберите станцию в меню",
+            text="Если не слышно: ПКМ по боту -> Громкость пользователя (100%) • Кнопка 'Тест звука'",
             icon_url=guild.icon.url if guild.icon else None,
         )
         return embed
@@ -342,12 +416,10 @@ class RadioCog(commands.Cog):
         if hasattr(text_channel, "id"):
             state.text_channel_id = text_channel.id
 
-        # Отменяем автоотключение, если было запланировано
         if state.disconnect_task and not state.disconnect_task.done():
             state.disconnect_task.cancel()
             state.disconnect_task = None
 
-        # Разбор станции или прямой ссылки
         if station_or_url:
             clean = station_or_url.strip()
             if clean.startswith("http://") or clean.startswith("https://"):
@@ -366,7 +438,6 @@ class RadioCog(commands.Cog):
                     state.station_key = DEFAULT_STATION_KEY
                     state.custom_url = None
 
-        # Подключение к голосовому каналу
         vc: Optional[discord.VoiceClient] = guild.voice_client
         try:
             if not vc or not vc.is_connected():
@@ -379,9 +450,8 @@ class RadioCog(commands.Cog):
             if "davey" in err_str.lower() or "nacl" in err_str.lower():
                 msg = (
                     f"❌ **Не удалось подключиться к каналу:** {e}\n\n"
-                    f"💡 *Для работы голоса в discord.py требуется библиотека `davey` и `PyNaCl`.*\n"
-                    f"Они уже добавлены в `requirements.txt`. Перезапустите бота на сервере хостинга "
-                    f"или выполните: `pip install davey PyNaCl`."
+                    f"💡 *Требуется библиотека `davey` и `PyNaCl`.*\n"
+                    f"Выполните на сервере: `pip install davey PyNaCl`."
                 )
             else:
                 msg = f"❌ Не удалось подключиться к каналу **{target_channel.name}**: {e}"
@@ -392,8 +462,8 @@ class RadioCog(commands.Cog):
                 await text_channel.send(msg, delete_after=15)
             return
 
-        # Ожидаем завершения голосового рукопожатия и готовности DAVE E2EE
-        for _ in range(20):
+        # Даем завершиться сетевому и DAVE E2EE рукопожатию
+        for _ in range(15):
             if vc.is_connected():
                 conn = getattr(vc, "_connection", None)
                 if conn and getattr(conn, "dave_protocol_version", 0) > 0:
@@ -403,12 +473,12 @@ class RadioCog(commands.Cog):
                     break
             await asyncio.sleep(0.1)
 
-        # Воспроизведение потока
+        # Запуск воспроизведения
         try:
             if vc.is_playing() or vc.is_paused():
                 vc.stop()
 
-            audio_source = self._create_audio_source(state.stream_url, state.volume)
+            audio_source = self._create_audio_source(state.stream_url, state.volume, vc, state.display_name)
             vc.play(audio_source, after=lambda err: self._on_playback_error(guild, err))
             state.is_paused = False
         except discord.ClientException as e:
@@ -437,14 +507,9 @@ class RadioCog(commands.Cog):
                 await text_channel.send(msg, delete_after=15)
             return
 
-        # ========================================================
-        # УСПЕШНЫЙ ЗАПУСК РАДИО:
-        # Только здесь отправляем публичный виджет для всех участников!
-        # ========================================================
         embed = self.build_embed(guild, state)
         view = RadioPlayerView(self, guild, state)
 
-        # Удаляем предыдущий плеер, если был
         if state.message:
             try:
                 await state.message.delete()
@@ -456,7 +521,6 @@ class RadioCog(commands.Cog):
         except Exception as e:
             logger.warning(f"Ошибка отправки публичной панели плеера: {e}")
 
-        # Автору команды отправляем персональный ответ (ephemeral)
         if interaction:
             try:
                 await interaction.followup.send(
@@ -465,6 +529,37 @@ class RadioCog(commands.Cog):
                 )
             except Exception:
                 pass
+
+    async def play_test_beep(self, guild: discord.Guild):
+        """Проигрывает тестовый 3-секундный сигнал 440 Гц."""
+        vc: Optional[discord.VoiceClient] = guild.voice_client
+        if not vc or not vc.is_connected():
+            return
+
+        state = self.get_state(guild.id)
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+
+        beep = BeepAudioSource(duration_sec=3.0, freq=440.0)
+        source = MonitoredAudioSource(beep, vc, "Test Beep 440Hz")
+
+        def after_beep(err):
+            if err:
+                logger.error(f"Ошибка тестового звука: {err}")
+            # Возвращаем радиостанцию после окончания теста
+            asyncio.run_coroutine_threadsafe(
+                self._resume_radio_after_test(guild), self.bot.loop
+            )
+
+        vc.play(source, after=after_beep)
+
+    async def _resume_radio_after_test(self, guild: discord.Guild):
+        await asyncio.sleep(0.5)
+        state = self.get_state(guild.id)
+        vc: Optional[discord.VoiceClient] = guild.voice_client
+        if vc and vc.is_connected() and not state.is_paused:
+            audio_source = self._create_audio_source(state.stream_url, state.volume, vc, state.display_name)
+            vc.play(audio_source, after=lambda err: self._on_playback_error(guild, err))
 
     async def change_station(
         self,
@@ -481,7 +576,7 @@ class RadioCog(commands.Cog):
             try:
                 if vc.is_playing() or vc.is_paused():
                     vc.stop()
-                audio_source = self._create_audio_source(state.stream_url, state.volume)
+                audio_source = self._create_audio_source(state.stream_url, state.volume, vc, state.display_name)
                 vc.play(audio_source, after=lambda err: self._on_playback_error(guild, err))
                 state.is_paused = False
             except Exception as e:
@@ -544,7 +639,7 @@ class RadioCog(commands.Cog):
 
     def _on_playback_error(self, guild: discord.Guild, error: Optional[Exception]):
         if error:
-            logger.error(f"Ошибка потока радио на сервере {guild.name} ({guild.id}): {error}")
+            logger.error(f"❌ Ошибка потока радио на сервере {guild.name} ({guild.id}): {error}")
 
     # ==========================================
     # СЛЭШ-КОМАНДЫ
@@ -563,9 +658,9 @@ class RadioCog(commands.Cog):
             app_commands.Choice(name="🌊 Record Deep (Deep House)", value="deep"),
             app_commands.Choice(name="☕ Record Chill-Out (Релакс / Чилл)", value="chill"),
             app_commands.Choice(name="🇷🇺 Record Russian Hits (Русские хиты)", value="russian"),
+            app_commands.Choice(name="🎧 Record Lofi Chill (Lofi биты)", value="lofi"),
             app_commands.Choice(name="⭐ Europa Plus (Поп / Мировые хиты)", value="europa"),
             app_commands.Choice(name="🔥 DFM (Клубная танцевальная музыка)", value="dfm"),
-            app_commands.Choice(name="🎧 Lofi Chill Radio (Lofi биты для учебы/отдыха)", value="lofi"),
             app_commands.Choice(name="🎶 Новое Радио (Свежие суперхиты)", value="newradio"),
         ]
     )
@@ -581,7 +676,6 @@ class RadioCog(commands.Cog):
                 ephemeral=True,
             )
 
-        # Все промежуточные статусы и ошибки видит ТОЛЬКО автор команды
         await interaction.response.defer(ephemeral=True)
         await self.play_stream(
             guild=interaction.guild,
@@ -590,6 +684,61 @@ class RadioCog(commands.Cog):
             station_or_url=station,
             interaction=interaction,
         )
+
+    @app_commands.command(
+        name="radiotest",
+        description="Воспроизвести громкий 3-секундный тестовый звук (440 Гц) для проверки связи",
+    )
+    async def slash_radiotest(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        if not vc or not vc.is_connected():
+            return await interaction.response.send_message(
+                "⚠️ Бот в данный момент не подключен к голосовому каналу. Сначала запустите `/radio`.",
+                ephemeral=True,
+            )
+        await interaction.response.send_message(
+            "🔔 **Проигрываю 3-секундный тестовый сигнал 440 Гц...**\n"
+            "Если звука нет — нажмите ПКМ по боту в канале -> проверьте ползунок **Громкость пользователя** "
+            "и снимите чекбокс «Заглушить».",
+            ephemeral=True,
+        )
+        await self.play_test_beep(interaction.guild)
+
+    @app_commands.command(
+        name="radiodebug",
+        description="Показать диагностику голосового подключения и шифрования DAVE",
+    )
+    async def slash_radiodebug(self, interaction: discord.Interaction):
+        vc: Optional[discord.VoiceClient] = interaction.guild.voice_client
+        if not vc:
+            return await interaction.response.send_message("❌ Бот не подключен к голосовому каналу.", ephemeral=True)
+
+        conn = getattr(vc, "_connection", None)
+        dave_ver = getattr(conn, "dave_protocol_version", "Отсутствует")
+        can_enc = getattr(conn, "can_encrypt", False)
+        mode = getattr(vc, "mode", "N/A")
+        is_playing = vc.is_playing()
+        state = self.get_state(interaction.guild.id)
+
+        desc = (
+            f"**Канал:** `#{vc.channel.name}` (ID: `{vc.channel.id}`)\n"
+            f"**Пинг:** `{round(vc.latency * 1000, 1)} мс`\n"
+            f"**Статус передачи:** `{'🟢 Передает аудио' if is_playing else '⏸️ Не передает'}`\n"
+            f"**Режим шифрования:** `{mode}`\n"
+            f"**DAVE E2EE версия:** `{dave_ver}`\n"
+            f"**Шифрование готово (can_encrypt):** `{'✅ ДА' if can_enc else '❌ НЕТ (ключи не согласованы)'}`\n"
+            f"**Громкость бота в коде:** `{int(state.volume * 100)}%`\n\n"
+            f"💡 **Если вокруг аватарки бота горит зеленый круг, но звука нет:**\n"
+            f"1. Нажмите **ПКМ по боту** в голосовом канале -> **Громкость пользователя** -> поставьте `100%`.\n"
+            f"2. Проверьте, не стоит ли галочка **Заглушить**.\n"
+            f"3. Нажмите кнопку **🔔 Тест звука** в плеере."
+        )
+        embed = discord.Embed(
+            title="🔍 Диагностика голосового подключения",
+            description=desc,
+            color=discord.Color.blue(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(
         name="radio_stop",
@@ -630,6 +779,18 @@ class RadioCog(commands.Cog):
             text_channel=ctx.channel,
             station_or_url=station,
         )
+
+    @commands.command(name="radiotest", aliases=["тестзвука"])
+    async def cmd_radiotest(self, ctx: commands.Context):
+        """Воспроизвести тестовый сигнал 440 Гц."""
+        vc = ctx.guild.voice_client
+        if not vc or not vc.is_connected():
+            return await ctx.send("⚠️ Бот не подключен к голосовому каналу. Включите сначала `!radio`.", delete_after=10)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+        await self.play_test_beep(ctx.guild)
 
     @commands.command(name="stop", aliases=["стоп", "leave", "disconnect", "radio_stop"])
     async def cmd_stop(self, ctx: commands.Context):
@@ -688,7 +849,6 @@ class RadioCog(commands.Cog):
         if not vc or not vc.channel:
             return
 
-        # Проверяем, сколько живых пользователей (не ботов) осталось в канале
         human_listeners = [m for m in vc.channel.members if not m.bot]
         state = self.get_state(guild.id)
 
