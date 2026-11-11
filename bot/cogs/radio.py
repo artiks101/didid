@@ -8,6 +8,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from bot.config import Config
+
 logger = logging.getLogger("bot.cogs.radio")
 
 # Список проверенных качественных онлайн-радиостанций
@@ -316,6 +318,16 @@ class RadioPlayerView(discord.ui.View):
                 ephemeral=True,
             )
 
+        vc = interaction.guild.voice_client
+        if vc and vc.channel:
+            other_listeners = [m for m in vc.channel.members if not m.bot and m.id != interaction.user.id]
+            if len(other_listeners) > 0 and not self.cog._has_radio_permission(interaction.user):
+                return await interaction.response.send_message(
+                    f"⚠️ В канале слушают радио другие участники ({len(other_listeners)} чел.). "
+                    f"Отключить бота могут только администраторы или обладатели ролей победителей топов!",
+                    ephemeral=True,
+                )
+
         await interaction.response.defer(ephemeral=True)
         await self.cog.stop_radio(interaction.guild, interaction=interaction)
 
@@ -343,6 +355,19 @@ class RadioCog(commands.Cog):
                 source = source.original
             if hasattr(source, "volume"):
                 source.volume = state.volume
+
+    def _has_radio_permission(self, member: discord.Member) -> bool:
+        """Проверяет, является ли участник администратором или победителем топов месяца."""
+        if not isinstance(member, discord.Member):
+            return False
+
+        # 1. Владелец сервера или права администратора
+        if member.guild_permissions.administrator or (member.guild and member.id == member.guild.owner_id):
+            return True
+
+        # 2. Обладатели роли победителя топа войса или чата
+        top_role_ids = {Config.VOICE_TOP_ROLE_ID, Config.CHAT_TOP_ROLE_ID}
+        return any(role.id in top_role_ids for role in member.roles)
 
     def _get_target_voice_channel(
         self,
@@ -425,6 +450,7 @@ class RadioCog(commands.Cog):
         text_channel: discord.abc.Messageable,
         station_or_url: Optional[str] = None,
         interaction: Optional[discord.Interaction] = None,
+        invoker: Optional[discord.Member] = None,
     ):
         state = self.get_state(guild.id)
         state.channel_id = target_channel.id
@@ -434,6 +460,41 @@ class RadioCog(commands.Cog):
         if state.disconnect_task and not state.disconnect_task.done():
             state.disconnect_task.cancel()
             state.disconnect_task = None
+
+        vc: Optional[discord.VoiceClient] = guild.voice_client
+
+        # 1. Защита от перетягивания:
+        # Если бот уже играет в другом голосовом канале, и там есть другие живые слушатели
+        if vc and vc.channel and vc.channel.id != target_channel.id:
+            invoker_id = invoker.id if invoker else 0
+            other_listeners = [m for m in vc.channel.members if not m.bot and m.id != invoker_id]
+            if len(other_listeners) > 0:
+                msg = (
+                    f"⚠️ **Нельзя перетянуть радио в другой канал!**\n"
+                    f"В канале **#{vc.channel.name}** сейчас слушают музыку другие участники ({len(other_listeners)} чел.).\n"
+                    f"Перетягивать бота запрещено, пока в канале есть слушатели."
+                )
+                if interaction:
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await text_channel.send(msg, delete_after=15)
+                return
+
+        # 2. Права доступа:
+        # Запускать радио в новом канале или переносить разрешено только администраторам и победителям топов
+        is_already_in_this_channel = (vc and vc.channel and vc.channel.id == target_channel.id)
+        if not is_already_in_this_channel and invoker is not None:
+            if not self._has_radio_permission(invoker):
+                msg = (
+                    "⚠️ **У вас нет прав на подключение или перенос радио!**\n"
+                    "Запускать радио могут только **администраторы** "
+                    "и обладатели ролей **победителей топов** (Голосовой топ / Топ чата)."
+                )
+                if interaction:
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await text_channel.send(msg, delete_after=15)
+                return
 
         if station_or_url:
             clean = station_or_url.strip()
@@ -453,7 +514,6 @@ class RadioCog(commands.Cog):
                     state.station_key = DEFAULT_STATION_KEY
                     state.custom_url = None
 
-        vc: Optional[discord.VoiceClient] = guild.voice_client
         try:
             if not vc or not vc.is_connected():
                 vc = await target_channel.connect()
@@ -698,6 +758,7 @@ class RadioCog(commands.Cog):
             text_channel=interaction.channel,
             station_or_url=station,
             interaction=interaction,
+            invoker=interaction.user,
         )
 
     @app_commands.command(
@@ -778,6 +839,16 @@ class RadioCog(commands.Cog):
                 "⚠️ Бот в данный момент не подключен к голосовому каналу.",
                 ephemeral=True,
             )
+
+        if vc.channel:
+            other_listeners = [m for m in vc.channel.members if not m.bot and m.id != interaction.user.id]
+            if len(other_listeners) > 0 and not self._has_radio_permission(interaction.user):
+                return await interaction.response.send_message(
+                    f"⚠️ В канале слушают радио другие участники ({len(other_listeners)} чел.). "
+                    f"Отключить бота могут только администраторы или обладатели ролей победителей топов!",
+                    ephemeral=True,
+                )
+
         await interaction.response.defer(ephemeral=True)
         await self.stop_radio(interaction.guild, interaction=interaction)
 
@@ -805,6 +876,7 @@ class RadioCog(commands.Cog):
             target_channel=target_channel,
             text_channel=ctx.channel,
             station_or_url=station,
+            invoker=ctx.author,
         )
 
     @commands.command(name="radiotest", aliases=["тестзвука"])
@@ -825,6 +897,15 @@ class RadioCog(commands.Cog):
         vc = ctx.guild.voice_client
         if not vc or not vc.is_connected():
             return await ctx.send("⚠️ Бот в данный момент не подключен к голосовому каналу.", delete_after=10)
+
+        if vc.channel:
+            other_listeners = [m for m in vc.channel.members if not m.bot and m.id != ctx.author.id]
+            if len(other_listeners) > 0 and not self._has_radio_permission(ctx.author):
+                return await ctx.send(
+                    f"⚠️ В канале слушают радио другие участники ({len(other_listeners)} чел.). "
+                    f"Отключить бота могут только администраторы или обладатели ролей победителей топов!",
+                    delete_after=12,
+                )
 
         try:
             await ctx.message.delete()
