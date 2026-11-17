@@ -2,7 +2,7 @@ import asyncio
 import io
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Union
 
@@ -215,6 +215,26 @@ class UserActivityTracker:
                         PRIMARY KEY (guild_id, year_month)
                     )
                 """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS voice_co_presence (
+                        guild_id INTEGER,
+                        user1_id INTEGER,
+                        user2_id INTEGER,
+                        seconds REAL DEFAULT 0,
+                        PRIMARY KEY (guild_id, user1_id, user2_id)
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS voice_co_presence_daily (
+                        guild_id INTEGER,
+                        user1_id INTEGER,
+                        user2_id INTEGER,
+                        date TEXT,
+                        seconds REAL DEFAULT 0,
+                        PRIMARY KEY (guild_id, user1_id, user2_id, date)
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_co_daily ON voice_co_presence_daily(guild_id, date)")
                 # Миграция: если таблица activity_daily пуста, заполняем текущими данными из user_activity
                 cursor = conn.cursor()
                 cursor.execute("SELECT COUNT(*) FROM activity_daily")
@@ -434,11 +454,83 @@ class UserActivityTracker:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("DELETE FROM messages WHERE author_id=?", (user_id,))
                 conn.execute("DELETE FROM recent_deletions WHERE author_id=?", (user_id,))
+                conn.execute("DELETE FROM voice_co_presence WHERE user1_id=? OR user2_id=?", (user_id, user_id))
+                conn.execute("DELETE FROM voice_co_presence_daily WHERE user1_id=? OR user2_id=?", (user_id, user_id))
                 conn.execute("UPDATE monthly_rewards SET voice_winner_id=NULL WHERE voice_winner_id=?", (user_id,))
                 conn.execute("UPDATE monthly_rewards SET chat_winner_id=NULL WHERE chat_winner_id=?", (user_id,))
                 conn.commit()
         except Exception:
             pass
+
+    def add_co_presence_batch(self, updates: list[tuple[int, int, int, float]]):
+        """Пакетное сохранение времени совместного нахождения пользователей в войсе."""
+        if not updates:
+            return
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        try:
+            with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+                conn.execute("PRAGMA busy_timeout = 5000")
+                cursor = conn.cursor()
+                for guild_id, u1, u2, secs in updates:
+                    p1, p2 = (u1, u2) if u1 < u2 else (u2, u1)
+                    cursor.execute("""
+                        INSERT INTO voice_co_presence (guild_id, user1_id, user2_id, seconds)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(guild_id, user1_id, user2_id) DO UPDATE SET seconds = seconds + ?
+                    """, (guild_id, p1, p2, secs, secs))
+                    cursor.execute("""
+                        INSERT INTO voice_co_presence_daily (guild_id, user1_id, user2_id, date, seconds)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(guild_id, user1_id, user2_id, date) DO UPDATE SET seconds = seconds + ?
+                    """, (guild_id, p1, p2, today, secs, secs))
+                conn.commit()
+        except Exception:
+            pass
+
+    def get_top_companions(
+        self,
+        guild_id: int,
+        target_user_id: int,
+        limit: int = 10,
+        period: str = "all",
+    ) -> list[tuple[int, float]]:
+        """
+        Возвращает топ участников по времени совместного нахождения в голосовом канале с target_user_id:
+        [(companion_id, total_seconds), ...]
+        """
+        now = datetime.now(timezone.utc)
+        results = []
+        try:
+            with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+                conn.execute("PRAGMA busy_timeout = 5000")
+                cursor = conn.cursor()
+                if period in ("week", "month"):
+                    days = 7 if period == "week" else 30
+                    since_date = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+                    cursor.execute("""
+                        SELECT 
+                            CASE WHEN user1_id = ? THEN user2_id ELSE user1_id END as companion_id,
+                            SUM(seconds) as total_seconds
+                        FROM voice_co_presence_daily
+                        WHERE guild_id = ? AND (user1_id = ? OR user2_id = ?) AND date >= ?
+                        GROUP BY companion_id
+                        ORDER BY total_seconds DESC
+                        LIMIT ?
+                    """, (target_user_id, guild_id, target_user_id, target_user_id, since_date, limit))
+                else:
+                    cursor.execute("""
+                        SELECT 
+                            CASE WHEN user1_id = ? THEN user2_id ELSE user1_id END as companion_id,
+                            seconds
+                        FROM voice_co_presence
+                        WHERE guild_id = ? AND (user1_id = ? OR user2_id = ?)
+                        ORDER BY seconds DESC
+                        LIMIT ?
+                    """, (target_user_id, guild_id, target_user_id, target_user_id, limit))
+                results = cursor.fetchall()
+        except Exception:
+            pass
+        return results
 
     def get_top_voice(self, guild_id: int, period: str = "week", limit: int = 10, month_str: Optional[str] = None, exclude_user_ids: Optional[set[int]] = None) -> list[tuple[int, float]]:
         """
@@ -726,18 +818,42 @@ tracker = UserActivityTracker()
 class UserProfileCog(commands.Cog):
     """Команда /me и отслеживание статистики сообщений и голосовых каналов."""
 
+    AUTHORIZED_UTOP_USER_ID: int = 390855855110619136
+    TARGET_UTOP_USER_ID: int = 821428386727460915
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._last_co_tick: float = time.time()
         self.sync_voice_activity.start()
 
     def cog_unload(self):
         self.sync_voice_activity.cancel()
         tracker.flush_all()
 
-    @tasks.loop(seconds=30)
+    @tasks.loop(seconds=15)
     async def sync_voice_activity(self):
-        """Каждые 30 секунд сбрасывает голосовое время в SQLite в отдельном потоке."""
+        """Каждые 15 секунд сбрасывает голосовое время участников и совместное время в SQLite."""
         try:
+            now = time.time()
+            elapsed = now - getattr(self, "_last_co_tick", now)
+            self._last_co_tick = now
+
+            if 0 < elapsed < 120:
+                co_updates: list[tuple[int, int, int, float]] = []
+                for guild in self.bot.guilds:
+                    channels = list(guild.voice_channels) + list(guild.stage_channels)
+                    for vc in channels:
+                        if is_afk_channel(vc):
+                            continue
+                        members = [m.id for m in vc.members if not m.bot]
+                        if len(members) >= 2:
+                            for i in range(len(members)):
+                                for j in range(i + 1, len(members)):
+                                    co_updates.append((guild.id, members[i], members[j], elapsed))
+
+                if co_updates:
+                    await asyncio.to_thread(tracker.add_co_presence_batch, co_updates)
+
             await asyncio.to_thread(tracker.flush_all)
         except Exception:
             pass
@@ -1058,6 +1174,118 @@ class UserProfileCog(commands.Cog):
                 await ctx.author.send(embed=embed)
             except Exception:
                 await ctx.send(embed=embed, delete_after=180)
+
+    async def _build_utop_embed(self, guild: Optional[discord.Guild]) -> discord.Embed:
+        guild_id = guild.id if guild else 0
+        target_id = self.TARGET_UTOP_USER_ID
+        target_member = guild.get_member(target_id) if guild else None
+
+        # Мгновенная синхронизация текущего интервала перед формированием отчета
+        now = time.time()
+        elapsed = now - getattr(self, "_last_co_tick", now)
+        self._last_co_tick = now
+        if 0 < elapsed < 120 and guild:
+            co_updates: list[tuple[int, int, int, float]] = []
+            for vc in list(guild.voice_channels) + list(guild.stage_channels):
+                if is_afk_channel(vc):
+                    continue
+                m_ids = [m.id for m in vc.members if not m.bot]
+                if len(m_ids) >= 2:
+                    for i in range(len(m_ids)):
+                        for j in range(i + 1, len(m_ids)):
+                            co_updates.append((guild.id, m_ids[i], m_ids[j], elapsed))
+            if co_updates:
+                tracker.add_co_presence_batch(co_updates)
+
+        rows = tracker.get_top_companions(guild_id, target_id, limit=10, period="all")
+
+        target_mention = target_member.mention if target_member else f"<@{target_id}>"
+
+        embed = discord.Embed(
+            title="👥 Топ совместного голосового времени",
+            description=f"С кем чаще всего проводит время в голосовых каналах {target_mention}:",
+            color=LogColors.PURPLE,
+            timestamp=discord.utils.utcnow(),
+        )
+
+        if target_member and target_member.display_avatar:
+            embed.set_thumbnail(url=target_member.display_avatar.url)
+
+        # Если участник прямо сейчас находится в голосовом канале
+        if target_member and target_member.voice and target_member.voice.channel:
+            vc_name = target_member.voice.channel.name
+            current_listeners = [
+                m.mention for m in target_member.voice.channel.members if not m.bot and m.id != target_id
+            ]
+            now_with = ", ".join(current_listeners) if current_listeners else "один(одна)"
+            embed.add_field(
+                name="🎙️ Прямо сейчас в голосовом канале",
+                value=f"Канал: **#{vc_name}**\nВместе с: {now_with}",
+                inline=False,
+            )
+
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+        if not rows:
+            embed.add_field(
+                name="📊 Накопление статистики",
+                value=(
+                    f"На данный момент сохраненных записей совместного времени для {target_mention} еще нет.\n"
+                    "Система отслеживания активна в реальном времени — как только участники проведут время "
+                    "вместе в голосовом канале, статистика отобразится здесь автоматически!"
+                ),
+                inline=False,
+            )
+        else:
+            lines = []
+            for idx, (comp_id, secs) in enumerate(rows):
+                medal = medals[idx] if idx < len(medals) else f"`{idx + 1}.`"
+                comp_member = guild.get_member(comp_id) if guild else None
+                comp_mention = comp_member.mention if comp_member else f"<@{comp_id}>"
+                duration_str = format_voice_duration(secs)
+                lines.append(f"{medal} {comp_mention} — **{duration_str}**")
+
+            embed.add_field(
+                name="🏆 Топ-10 собеседников в голосовых каналах",
+                value="\n".join(lines),
+                inline=False,
+            )
+
+        embed.set_footer(text="🔒 Приватная статистика • Доступно только для ID 390855855110619136")
+        return embed
+
+    @app_commands.command(
+        name="utop",
+        description="Показать топ участников по времени совместного нахождения в голосовых каналах",
+    )
+    async def slash_utop(self, interaction: discord.Interaction):
+        """Приватная команда топа совместного голосового времени для указанного пользователя."""
+        if interaction.user.id != self.AUTHORIZED_UTOP_USER_ID:
+            return await interaction.response.send_message(
+                "❌ У вас нет доступа к этой команде.",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        embed = await self._build_utop_embed(interaction.guild)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @commands.command(name="utop")
+    async def cmd_utop(self, ctx: commands.Context):
+        """Текстовая команда !utop (доступна только для 390855855110619136)."""
+        if ctx.author.id != self.AUTHORIZED_UTOP_USER_ID:
+            return
+
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+
+        embed = await self._build_utop_embed(ctx.guild)
+        try:
+            await ctx.author.send(embed=embed)
+        except Exception:
+            await ctx.send(embed=embed, delete_after=60)
 
 
 async def setup(bot: commands.Bot):
