@@ -526,16 +526,24 @@ class RadioCog(commands.Cog):
                     state.custom_url = None
 
         try:
-            if vc and vc.is_connected() and vc.channel.id != target_channel.id:
-                # Если бот уже находится в другом канале, выходим из него и заходим в новый канал
+            if not vc or not vc.is_connected():
+                vc = await target_channel.connect()
+            elif vc.channel.id != target_channel.id:
+                # 1. Заранее глушим аудиопоток, чтобы процесс FFmpeg штатно завершился без SIGKILL (-9)
+                if vc.is_playing() or vc.is_paused():
+                    vc.stop()
+                    await asyncio.sleep(0.15)
+                # 2. Мягко переводим бота в целевой голосовой канал
                 try:
-                    await vc.disconnect(force=False)
-                    await asyncio.sleep(0.4)
-                except Exception as disc_err:
-                    logger.warning(f"Ошибка при выходе из предыдущего канала: {disc_err}")
-                vc = await target_channel.connect()
-            elif not vc or not vc.is_connected():
-                vc = await target_channel.connect()
+                    await vc.move_to(target_channel)
+                except Exception as move_err:
+                    logger.warning(f"move_to не удался ({move_err}), выполняем повторное подключение...")
+                    try:
+                        await vc.disconnect(force=True)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.8)
+                    vc = await target_channel.connect()
         except Exception as e:
             err_str = str(e)
             logger.exception(f"Ошибка подключения к голосовому каналу {target_channel.name}: {e}")
