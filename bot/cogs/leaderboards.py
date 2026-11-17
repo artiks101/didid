@@ -443,34 +443,43 @@ class LeaderboardsCog(commands.Cog):
         self.auto_refresh_tops.cancel()
         self.auto_check_monthly_rewards.cancel()
 
-    async def update_guild_leaderboard(self, guild: discord.Guild) -> bool:
-        """Обновляет или отправляет карточки топов и правил в настроенный канал, очищая дубликаты."""
+    def _is_admin(self, member: discord.Member) -> bool:
+        """Проверяет, является ли пользователь администратором или владельцем сервера."""
+        if not isinstance(member, discord.Member):
+            return False
+        return member.guild_permissions.administrator or (member.guild and member.id == member.guild.owner_id)
+
+    async def update_guild_leaderboard(self, guild: discord.Guild, recreate: bool = False) -> tuple[bool, str]:
+        """Обновляет или отправляет карточки топов и правил в настроенный канал, очищая дубликаты.
+        Если recreate=True, старые сообщения бота полностью удаляются и отправляются заново."""
         async with self._lock:
             # Сбрасываем кэш сгенерированных карточек для отображения свежих данных
             _TOP_CARD_CACHE.clear()
 
             channel = self.bot.get_channel(Config.TOP_CHANNEL_ID)
             if not isinstance(channel, discord.TextChannel):
-                return False
+                return False, f"Канал топов с ID `{Config.TOP_CHANNEL_ID}` не найден."
 
             perms = channel.permissions_for(guild.me)
             if not (perms.send_messages and perms.embed_links):
                 logger.warning(f"Нет прав Send Messages или Embed Links в канале топов #{channel.name}")
-                return False
+                return False, f"У бота отсутствуют права 'Send Messages' или 'Embed Links' в #{channel.name}."
 
             voice_msg_id, msgs_msg_id, rules_msg_id = tracker.get_top_message_ids(guild.id)
             voice_msg: Optional[discord.Message] = None
             msgs_msg: Optional[discord.Message] = None
             rules_msg: Optional[discord.Message] = None
 
-            # Ищем существующие карточки бота в истории канала для устранения дублирования
+            # Ищем существующие сообщения бота в истории канала
             existing_voice_msgs: list[discord.Message] = []
             existing_text_msgs: list[discord.Message] = []
             existing_rules_msgs: list[discord.Message] = []
+            all_bot_msgs: list[discord.Message] = []
 
             try:
-                async for msg in channel.history(limit=30):
+                async for msg in channel.history(limit=50):
                     if msg.author.id == self.bot.user.id:
+                        all_bot_msgs.append(msg)
                         if voice_msg_id and msg.id == voice_msg_id:
                             existing_voice_msgs.append(msg)
                         elif msgs_msg_id and msg.id == msgs_msg_id:
@@ -479,9 +488,9 @@ class LeaderboardsCog(commands.Cog):
                             existing_rules_msgs.append(msg)
                         elif msg.embeds:
                             title = msg.embeds[0].title or ""
-                            if "голосовому времени" in title:
+                            if "голосовому времени" in title or "Голосовые каналы" in title:
                                 existing_voice_msgs.append(msg)
-                            elif "по сообщениям" in title:
+                            elif "по сообщениям" in title or "Текстовые каналы" in title:
                                 existing_text_msgs.append(msg)
                             elif "Правила и условия" in title:
                                 existing_rules_msgs.append(msg)
@@ -494,54 +503,91 @@ class LeaderboardsCog(commands.Cog):
             except Exception as e:
                 logger.warning(f"Ошибка при проверке истории #{channel.name}: {e}")
 
-            # Если бот обнаружил дубликаты, удаляем лишние
-            if len(existing_voice_msgs) > 1:
-                for extra in existing_voice_msgs[1:]:
+            if recreate:
+                # 1. Принудительное удаление ВСЕХ старых сообщений бота
+                to_delete: dict[int, discord.Message] = {m.id: m for m in all_bot_msgs}
+                for mid in (voice_msg_id, msgs_msg_id, rules_msg_id):
+                    if mid and mid not in to_delete:
+                        try:
+                            f_msg = await channel.fetch_message(mid)
+                            to_delete[mid] = f_msg
+                        except Exception:
+                            pass
+
+                for old_m in to_delete.values():
                     try:
-                        await extra.delete()
-                    except Exception:
-                        pass
-                existing_voice_msgs = existing_voice_msgs[:1]
+                        await old_m.delete()
+                        await asyncio.sleep(0.35)
+                    except Exception as e:
+                        logger.warning(f"Ошибка удаления старого сообщения {old_m.id}: {e}")
 
-            if len(existing_text_msgs) > 1:
-                for extra in existing_text_msgs[1:]:
+                existing_voice_msgs = []
+                existing_text_msgs = []
+                existing_rules_msgs = []
+                voice_msg = None
+                msgs_msg = None
+                rules_msg = None
+                in_correct_order = False
+            else:
+                # Если бот обнаружил дубликаты, удаляем лишние
+                if len(existing_voice_msgs) > 1:
+                    for extra in existing_voice_msgs[1:]:
+                        try:
+                            await extra.delete()
+                        except Exception:
+                            pass
+                    existing_voice_msgs = existing_voice_msgs[:1]
+
+                if len(existing_text_msgs) > 1:
+                    for extra in existing_text_msgs[1:]:
+                        try:
+                            await extra.delete()
+                        except Exception:
+                            pass
+                    existing_text_msgs = existing_text_msgs[:1]
+
+                if len(existing_rules_msgs) > 1:
+                    for extra in existing_rules_msgs[1:]:
+                        try:
+                            await extra.delete()
+                        except Exception:
+                            pass
+                    existing_rules_msgs = existing_rules_msgs[:1]
+
+                if existing_voice_msgs:
+                    voice_msg = existing_voice_msgs[0]
+                elif voice_msg_id:
                     try:
-                        await extra.delete()
-                    except Exception:
-                        pass
-                existing_text_msgs = existing_text_msgs[:1]
+                        voice_msg = await channel.fetch_message(voice_msg_id)
+                    except (discord.NotFound, discord.HTTPException):
+                        voice_msg = None
 
-            if len(existing_rules_msgs) > 1:
-                for extra in existing_rules_msgs[1:]:
+                if existing_text_msgs:
+                    msgs_msg = existing_text_msgs[0]
+                elif msgs_msg_id:
                     try:
-                        await extra.delete()
-                    except Exception:
-                        pass
-                existing_rules_msgs = existing_rules_msgs[:1]
+                        msgs_msg = await channel.fetch_message(msgs_msg_id)
+                    except (discord.NotFound, discord.HTTPException):
+                        msgs_msg = None
 
-            if existing_voice_msgs:
-                voice_msg = existing_voice_msgs[0]
-            elif voice_msg_id:
-                try:
-                    voice_msg = await channel.fetch_message(voice_msg_id)
-                except (discord.NotFound, discord.HTTPException):
-                    voice_msg = None
+                if existing_rules_msgs:
+                    rules_msg = existing_rules_msgs[0]
+                elif rules_msg_id:
+                    try:
+                        rules_msg = await channel.fetch_message(rules_msg_id)
+                    except (discord.NotFound, discord.HTTPException):
+                        rules_msg = None
 
-            if existing_text_msgs:
-                msgs_msg = existing_text_msgs[0]
-            elif msgs_msg_id:
-                try:
-                    msgs_msg = await channel.fetch_message(msgs_msg_id)
-                except (discord.NotFound, discord.HTTPException):
-                    msgs_msg = None
-
-            if existing_rules_msgs:
-                rules_msg = existing_rules_msgs[0]
-            elif rules_msg_id:
-                try:
-                    rules_msg = await channel.fetch_message(rules_msg_id)
-                except (discord.NotFound, discord.HTTPException):
-                    rules_msg = None
+                # Проверяем, существуют ли все 3 сообщения и идут ли они в правильном порядке:
+                # 1: Правила -> 2: Голосовой топ -> 3: Топ сообщений
+                in_correct_order = (
+                    rules_msg is not None and
+                    voice_msg is not None and
+                    msgs_msg is not None and
+                    rules_msg.id != voice_msg.id and
+                    voice_msg.id != msgs_msg.id and
+                    rules_msg.created_at < voice_msg.created_at < msgs_msg.created_at
+                )
 
             voice_card = await build_voice_top_card(guild, period="week", animated=True)
             voice_view = VoiceTopView(current_period="week")
@@ -551,18 +597,7 @@ class LeaderboardsCog(commands.Cog):
 
             rules_embed = build_rules_embed(guild)
 
-            # Проверяем, существуют ли все 3 сообщения и идут ли они в правильном порядке:
-            # 1: Правила -> 2: Голосовой топ -> 3: Топ сообщений
-            in_correct_order = (
-                rules_msg is not None and
-                voice_msg is not None and
-                msgs_msg is not None and
-                rules_msg.id != voice_msg.id and
-                voice_msg.id != msgs_msg.id and
-                rules_msg.created_at < voice_msg.created_at < msgs_msg.created_at
-            )
-
-            if in_correct_order:
+            if in_correct_order and not recreate:
                 try:
                     await rules_msg.edit(embed=rules_embed)
                     if voice_card:
@@ -579,16 +614,22 @@ class LeaderboardsCog(commands.Cog):
                     in_correct_order = False
 
             if not in_correct_order:
-                # Если порядок нарушен или сообщения отсутствуют, очищаем старые карточки бота и отправляем в строгом порядке
-                all_bot_msgs = list({
+                # Очищаем оставшиеся карточки бота и отправляем заново в строгом порядке
+                all_bot_msgs_cleanup = list({
                     m.id: m for m in (existing_rules_msgs + existing_voice_msgs + existing_text_msgs)
                 }.values())
 
-                for old_m in all_bot_msgs:
+                for old_m in all_bot_msgs_cleanup:
                     try:
                         await old_m.delete()
                     except Exception:
                         pass
+
+                # Пересоздаем файлы, если они уже были открыты
+                if not voice_card or getattr(voice_card.fp, "closed", False):
+                    voice_card = await build_voice_top_card(guild, period="week", animated=True)
+                if not msgs_card or getattr(msgs_card.fp, "closed", False):
+                    msgs_card = await build_messages_top_card(guild, period="week", animated=True)
 
                 # 1. Первое сообщение: Правила и условия наград
                 rules_msg = await channel.send(embed=rules_embed)
@@ -611,9 +652,27 @@ class LeaderboardsCog(commands.Cog):
                 rules_msg.id if rules_msg else None
             )
 
+            # Проверяем права роли @everyone на чтение истории
+            warning_text = ""
+            default_role = guild.default_role
+            if default_role:
+                channel_perms = channel.permissions_for(default_role)
+                if not channel_perms.read_message_history:
+                    warning_text += (
+                        "\n\n⚠️ **Важное замечание:** В настройках канала "
+                        f"#{channel.name} у роли `@everyone` выключено право **«Читать историю сообщений»** (Read Message History)!\n"
+                        "Поэтому новые игроки не могут видеть текст сообщений, отправленных до их захода. "
+                        "Чтобы это исправить, включите в настройках канала: **Настройки канала -> Права доступа -> @everyone -> Читать историю сообщений** (зеленая галочка)."
+                    )
+                elif not channel_perms.view_channel:
+                    warning_text += (
+                        "\n\n⚠️ **Важное замечание:** В настройках канала "
+                        f"#{channel.name} у роли `@everyone` выключено право **«Просматривать канал»**!"
+                    )
+
             # Фоновый прогрев остальных периодов для мгновенного отклика кнопок
             asyncio.create_task(self.precache_all_periods(guild))
-            return True
+            return True, warning_text
 
     async def precache_all_periods(self, guild: discord.Guild):
         """В фоне генерирует остальные периоды в RAM, гарантируя мгновенный отклик при кликах."""
@@ -858,24 +917,94 @@ class LeaderboardsCog(commands.Cog):
             asyncio.create_task(self.precache_all_periods(guild))
 
     @app_commands.command(
+        name="resendtop",
+        description="[Администратор] Удалить старые сообщения и заново отправить правила и топы в канал"
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def resendtop_slash(self, interaction: discord.Interaction):
+        """Слэш-команда полного удаления старых сообщений бота и повторной отправки топов."""
+        await interaction.response.defer(ephemeral=True)
+        if not interaction.guild:
+            await interaction.followup.send("❌ Команда доступна только на сервере.", ephemeral=True)
+            return
+
+        if not self._is_admin(interaction.user):
+            await interaction.followup.send("❌ Команда доступна только администраторам сервера.", ephemeral=True)
+            return
+
+        ok, info = await self.update_guild_leaderboard(interaction.guild, recreate=True)
+        channel = self.bot.get_channel(Config.TOP_CHANNEL_ID)
+        ch_name = f"#{channel.name}" if channel else str(Config.TOP_CHANNEL_ID)
+        if ok:
+            await interaction.followup.send(
+                f"✅ **Старые сообщения удалены, новые карточки топов отправлены в {ch_name}!**{info}",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(f"❌ Ошибка: {info}", ephemeral=True)
+
+    @app_commands.command(
         name="updatetop",
         description="Обновить или пересоздать карточки топов в канале"
     )
+    @app_commands.describe(
+        recreate="Удалить старые сообщения и отправить заново? (True — пересоздать, False — обновить)"
+    )
     @app_commands.default_permissions(administrator=True)
-    async def updatetop_slash(self, interaction: discord.Interaction):
+    async def updatetop_slash(self, interaction: discord.Interaction, recreate: bool = False):
         """Слэш-команда ручного обновления карточек топов (для администраторов)"""
         await interaction.response.defer(ephemeral=True)
         if not interaction.guild:
             await interaction.followup.send("❌ Команда доступна только на сервере.", ephemeral=True)
             return
 
-        ok = await self.update_guild_leaderboard(interaction.guild)
+        if not self._is_admin(interaction.user):
+            await interaction.followup.send("❌ Команда доступна только администраторам сервера.", ephemeral=True)
+            return
+
+        ok, info = await self.update_guild_leaderboard(interaction.guild, recreate=recreate)
+        channel = self.bot.get_channel(Config.TOP_CHANNEL_ID)
+        ch_name = f"#{channel.name}" if channel else str(Config.TOP_CHANNEL_ID)
         if ok:
-            channel = self.bot.get_channel(Config.TOP_CHANNEL_ID)
-            ch_name = f"#{channel.name}" if channel else str(Config.TOP_CHANNEL_ID)
-            await interaction.followup.send(f"✅ Карточки топов успешно обновлены в канале {ch_name}!", ephemeral=True)
+            action_text = "заново отправлены (старые удалены)" if recreate else "успешно обновлены"
+            await interaction.followup.send(f"✅ Карточки топов {action_text} в канале {ch_name}!{info}", ephemeral=True)
         else:
-            await interaction.followup.send(f"❌ Не удалось найти канал с ID `{Config.TOP_CHANNEL_ID}` или отсутствуют права на отправку.", ephemeral=True)
+            await interaction.followup.send(f"❌ {info}", ephemeral=True)
+
+    @commands.command(name="resendtop", aliases=["recreatetop", "resend_top", "recreate_top", "переотправитьтоп"])
+    async def resendtop_cmd(self, ctx: commands.Context):
+        """[Администратор] Удалить старые сообщения и заново отправить карточки топов."""
+        if not self._is_admin(ctx.author):
+            return await ctx.send("❌ Команда доступна только администраторам сервера.", delete_after=10)
+
+        status_msg = await ctx.send("🔄 Удаляю старые сообщения и отправляю новые карточки топов...")
+        ok, info = await self.update_guild_leaderboard(ctx.guild, recreate=True)
+        channel = self.bot.get_channel(Config.TOP_CHANNEL_ID)
+        ch_name = f"#{channel.name}" if channel else str(Config.TOP_CHANNEL_ID)
+
+        if ok:
+            await status_msg.edit(
+                content=f"✅ **Старые сообщения удалены, новые карточки топов отправлены в {ch_name}!**{info}"
+            )
+        else:
+            await status_msg.edit(content=f"❌ Ошибка: {info}")
+
+    @commands.command(name="updatetop", aliases=["обновитьтоп"])
+    async def updatetop_cmd(self, ctx: commands.Context, recreate: bool = False):
+        """[Администратор] Обновить карточки топов. Добавьте 'true' для пересоздания с удалением старых."""
+        if not self._is_admin(ctx.author):
+            return await ctx.send("❌ Команда доступна только администраторам сервера.", delete_after=10)
+
+        status_msg = await ctx.send("🔄 Обновляю карточки топов...")
+        ok, info = await self.update_guild_leaderboard(ctx.guild, recreate=recreate)
+        channel = self.bot.get_channel(Config.TOP_CHANNEL_ID)
+        ch_name = f"#{channel.name}" if channel else str(Config.TOP_CHANNEL_ID)
+
+        if ok:
+            action = "заново отправлены (старые удалены)" if recreate else "успешно обновлены"
+            await status_msg.edit(content=f"✅ Карточки топов {action} в {ch_name}!{info}")
+        else:
+            await status_msg.edit(content=f"❌ Ошибка: {info}")
 
     @app_commands.command(
         name="reward_monthly",
