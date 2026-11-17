@@ -356,10 +356,19 @@ class RadioCog(commands.Cog):
             if hasattr(source, "volume"):
                 source.volume = state.volume
 
+    def _is_radio_super_user(self, member: discord.Member | int) -> bool:
+        """Проверяет, является ли пользователь привилегированным слушателем (super user)."""
+        uid = member if isinstance(member, int) else getattr(member, "id", 0)
+        return uid in Config.RADIO_SUPER_USER_IDS
+
     def _has_radio_permission(self, member: discord.Member) -> bool:
-        """Проверяет, является ли участник администратором или победителем топов месяца."""
+        """Проверяет, является ли участник супер-пользователем, администратором или победителем топов месяца."""
         if not isinstance(member, discord.Member):
             return False
+
+        # 0. Привилегированные пользователи (абсолютный приоритет)
+        if self._is_radio_super_user(member):
+            return True
 
         # 1. Владелец сервера или права администратора
         if member.guild_permissions.administrator or (member.guild and member.id == member.guild.owner_id):
@@ -465,10 +474,12 @@ class RadioCog(commands.Cog):
 
         # 1. Защита от перетягивания:
         # Если бот уже играет в другом голосовом канале, и там есть другие живые слушатели
+        # Привилегированные пользователи (super users) могут перетягивать бота в любой ситуации
+        is_super = invoker is not None and self._is_radio_super_user(invoker)
         if vc and vc.channel and vc.channel.id != target_channel.id:
             invoker_id = invoker.id if invoker else 0
             other_listeners = [m for m in vc.channel.members if not m.bot and m.id != invoker_id]
-            if len(other_listeners) > 0:
+            if len(other_listeners) > 0 and not is_super:
                 msg = (
                     f"⚠️ **Нельзя перетянуть радио в другой канал!**\n"
                     f"В канале **#{vc.channel.name}** сейчас слушают музыку другие участники ({len(other_listeners)} чел.).\n"
@@ -515,10 +526,16 @@ class RadioCog(commands.Cog):
                     state.custom_url = None
 
         try:
-            if not vc or not vc.is_connected():
+            if vc and vc.is_connected() and vc.channel.id != target_channel.id:
+                # Если бот уже находится в другом канале, выходим из него и заходим в новый канал
+                try:
+                    await vc.disconnect(force=False)
+                    await asyncio.sleep(0.4)
+                except Exception as disc_err:
+                    logger.warning(f"Ошибка при выходе из предыдущего канала: {disc_err}")
                 vc = await target_channel.connect()
-            elif vc.channel.id != target_channel.id:
-                await vc.move_to(target_channel)
+            elif not vc or not vc.is_connected():
+                vc = await target_channel.connect()
         except Exception as e:
             err_str = str(e)
             logger.exception(f"Ошибка подключения к голосовому каналу {target_channel.name}: {e}")
