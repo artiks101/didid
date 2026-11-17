@@ -109,15 +109,15 @@ class MonitoredAudioSource(discord.AudioSource):
     def read(self) -> bytes:
         data = self.original.read()
         self.frames += 1
-        # Логируем первые 3 фрейма и затем каждые 150 фреймов (раз в 3 сек)
-        if self.frames <= 3 or (self.frames % 150 == 0):
+        # Логируем только первые 3 фрейма при старте потока для подтверждения связи
+        if self.frames <= 3:
             conn = getattr(self.vc, "_connection", None)
             dave_ver = getattr(conn, "dave_protocol_version", "N/A")
             can_enc = getattr(conn, "can_encrypt", "N/A")
             non_zero = sum(1 for b in data[:200] if b != 0)
             logger.info(
-                f"[{self.station_name}] Фрейм #{self.frames}: длина={len(data)} байт, "
-                f"ненулевых сэмплов={non_zero}/200, DAVE_ver={dave_ver}, can_encrypt={can_enc}"
+                f"[{self.station_name}] Старт аудиопотока (фрейм #{self.frames}): длина={len(data)} байт, "
+                f"DAVE_ver={dave_ver}, can_encrypt={can_enc}"
             )
         return data
 
