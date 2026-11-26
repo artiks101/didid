@@ -221,9 +221,14 @@ class UserActivityTracker:
                         user1_id INTEGER,
                         user2_id INTEGER,
                         seconds REAL DEFAULT 0,
+                        last_interaction REAL,
                         PRIMARY KEY (guild_id, user1_id, user2_id)
                     )
                 """)
+                try:
+                    conn.execute("ALTER TABLE voice_co_presence ADD COLUMN last_interaction REAL")
+                except Exception:
+                    pass
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS voice_co_presence_daily (
                         guild_id INTEGER,
@@ -463,10 +468,11 @@ class UserActivityTracker:
             pass
 
     def add_co_presence_batch(self, updates: list[tuple[int, int, int, float]]):
-        """Пакетное сохранение времени совместного нахождения пользователей в войсе."""
+        """Пакетное сохранение времени и даты последнего взаимодействия в войсе."""
         if not updates:
             return
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        now_ts = time.time()
+        today = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d")
         try:
             with sqlite3.connect(self.db_path, timeout=10.0) as conn:
                 conn.execute("PRAGMA busy_timeout = 5000")
@@ -474,15 +480,39 @@ class UserActivityTracker:
                 for guild_id, u1, u2, secs in updates:
                     p1, p2 = (u1, u2) if u1 < u2 else (u2, u1)
                     cursor.execute("""
-                        INSERT INTO voice_co_presence (guild_id, user1_id, user2_id, seconds)
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT(guild_id, user1_id, user2_id) DO UPDATE SET seconds = seconds + ?
-                    """, (guild_id, p1, p2, secs, secs))
+                        INSERT INTO voice_co_presence (guild_id, user1_id, user2_id, seconds, last_interaction)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(guild_id, user1_id, user2_id) DO UPDATE SET
+                            seconds = seconds + ?,
+                            last_interaction = ?
+                    """, (guild_id, p1, p2, secs, now_ts, secs, now_ts))
                     cursor.execute("""
                         INSERT INTO voice_co_presence_daily (guild_id, user1_id, user2_id, date, seconds)
                         VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT(guild_id, user1_id, user2_id, date) DO UPDATE SET seconds = seconds + ?
                     """, (guild_id, p1, p2, today, secs, secs))
+                conn.commit()
+        except Exception:
+            pass
+
+    def touch_co_presence(self, guild_id: int, user_id: int, other_user_ids: list[int]):
+        """Обновляет timestamp последнего взаимодействия для существующих пар при входе/выходе из ГС."""
+        if not other_user_ids:
+            return
+        now_ts = time.time()
+        try:
+            with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+                conn.execute("PRAGMA busy_timeout = 3000")
+                cursor = conn.cursor()
+                for other_id in other_user_ids:
+                    if other_id == user_id:
+                        continue
+                    p1, p2 = (user_id, other_id) if user_id < other_id else (other_id, user_id)
+                    cursor.execute("""
+                        UPDATE voice_co_presence
+                        SET last_interaction = ?
+                        WHERE guild_id = ? AND user1_id = ? AND user2_id = ?
+                    """, (now_ts, guild_id, p1, p2))
                 conn.commit()
         except Exception:
             pass
@@ -493,10 +523,10 @@ class UserActivityTracker:
         target_user_id: int,
         limit: int = 10,
         period: str = "all",
-    ) -> list[tuple[int, float]]:
+    ) -> list[tuple[int, float, Optional[float], Optional[str]]]:
         """
         Возвращает топ участников по времени совместного нахождения в голосовом канале с target_user_id:
-        [(companion_id, total_seconds), ...]
+        [(companion_id, total_seconds, last_interaction_ts, last_date_str), ...]
         """
         now = datetime.now(timezone.utc)
         results = []
@@ -508,23 +538,35 @@ class UserActivityTracker:
                     days = 7 if period == "week" else 30
                     since_date = (now - timedelta(days=days)).strftime("%Y-%m-%d")
                     cursor.execute("""
-                        SELECT 
-                            CASE WHEN user1_id = ? THEN user2_id ELSE user1_id END as companion_id,
-                            SUM(seconds) as total_seconds
-                        FROM voice_co_presence_daily
-                        WHERE guild_id = ? AND (user1_id = ? OR user2_id = ?) AND date >= ?
+                        SELECT
+                            CASE WHEN d.user1_id = ? THEN d.user2_id ELSE d.user1_id END as companion_id,
+                            SUM(d.seconds) as total_seconds,
+                            c.last_interaction,
+                            MAX(d.date) as last_date
+                        FROM voice_co_presence_daily d
+                        LEFT JOIN voice_co_presence c
+                            ON c.guild_id = d.guild_id AND c.user1_id = d.user1_id AND c.user2_id = d.user2_id
+                        WHERE d.guild_id = ? AND (d.user1_id = ? OR d.user2_id = ?) AND d.date >= ?
                         GROUP BY companion_id
                         ORDER BY total_seconds DESC
                         LIMIT ?
                     """, (target_user_id, guild_id, target_user_id, target_user_id, since_date, limit))
                 else:
                     cursor.execute("""
-                        SELECT 
-                            CASE WHEN user1_id = ? THEN user2_id ELSE user1_id END as companion_id,
-                            seconds
-                        FROM voice_co_presence
-                        WHERE guild_id = ? AND (user1_id = ? OR user2_id = ?)
-                        ORDER BY seconds DESC
+                        SELECT
+                            CASE WHEN c.user1_id = ? THEN c.user2_id ELSE c.user1_id END as companion_id,
+                            c.seconds,
+                            c.last_interaction,
+                            (
+                                SELECT MAX(d.date)
+                                FROM voice_co_presence_daily d
+                                WHERE d.guild_id = c.guild_id
+                                  AND d.user1_id = c.user1_id
+                                  AND d.user2_id = c.user2_id
+                            ) as last_date
+                        FROM voice_co_presence c
+                        WHERE c.guild_id = ? AND (c.user1_id = ? OR c.user2_id = ?)
+                        ORDER BY c.seconds DESC
                         LIMIT ?
                     """, (target_user_id, guild_id, target_user_id, target_user_id, limit))
                 results = cursor.fetchall()
@@ -830,30 +872,33 @@ class UserProfileCog(commands.Cog):
         self.sync_voice_activity.cancel()
         tracker.flush_all()
 
+    async def _flush_co_presence(self):
+        """Собирает и сохраняет текущий интервал совместного пребывания в голосовых каналах."""
+        now = time.time()
+        elapsed = now - getattr(self, "_last_co_tick", now)
+        self._last_co_tick = now
+
+        if 0 < elapsed < 120:
+            co_updates: list[tuple[int, int, int, float]] = []
+            for guild in self.bot.guilds:
+                channels = list(guild.voice_channels) + list(guild.stage_channels)
+                for vc in channels:
+                    if is_afk_channel(vc):
+                        continue
+                    members = [m.id for m in vc.members if not m.bot]
+                    if len(members) >= 2:
+                        for i in range(len(members)):
+                            for j in range(i + 1, len(members)):
+                                co_updates.append((guild.id, members[i], members[j], elapsed))
+
+            if co_updates:
+                await asyncio.to_thread(tracker.add_co_presence_batch, co_updates)
+
     @tasks.loop(seconds=15)
     async def sync_voice_activity(self):
         """Каждые 15 секунд сбрасывает голосовое время участников и совместное время в SQLite."""
         try:
-            now = time.time()
-            elapsed = now - getattr(self, "_last_co_tick", now)
-            self._last_co_tick = now
-
-            if 0 < elapsed < 120:
-                co_updates: list[tuple[int, int, int, float]] = []
-                for guild in self.bot.guilds:
-                    channels = list(guild.voice_channels) + list(guild.stage_channels)
-                    for vc in channels:
-                        if is_afk_channel(vc):
-                            continue
-                        members = [m.id for m in vc.members if not m.bot]
-                        if len(members) >= 2:
-                            for i in range(len(members)):
-                                for j in range(i + 1, len(members)):
-                                    co_updates.append((guild.id, members[i], members[j], elapsed))
-
-                if co_updates:
-                    await asyncio.to_thread(tracker.add_co_presence_batch, co_updates)
-
+            await self._flush_co_presence()
             await asyncio.to_thread(tracker.flush_all)
         except Exception:
             pass
@@ -951,6 +996,16 @@ class UserProfileCog(commands.Cog):
         # 3. Переход между разными обычными (не AFK) каналами
         elif before.channel and after.channel and not before_afk and not after_afk and before.channel.id != after.channel.id:
             tracker.voice_switch(member.id, member.guild.id)
+
+        # Обновляем дату последнего взаимодействия в ГС при входе, выходе или переходе
+        if before.channel != after.channel:
+            other_ids: set[int] = set()
+            if before.channel and not before_afk:
+                other_ids.update(m.id for m in before.channel.members if not m.bot and m.id != member.id)
+            if after.channel and not after_afk:
+                other_ids.update(m.id for m in after.channel.members if not m.bot and m.id != member.id)
+            if other_ids:
+                await asyncio.to_thread(tracker.touch_co_presence, member.guild.id, member.id, list(other_ids))
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
@@ -1175,56 +1230,80 @@ class UserProfileCog(commands.Cog):
             except Exception:
                 await ctx.send(embed=embed, delete_after=180)
 
+    @staticmethod
+    def _format_last_interaction(last_ts: Optional[float], last_date_str: Optional[str]) -> str:
+        """Форматирует дату последнего взаимодействия (точный timestamp Discord или дату из дневной статистики)."""
+        if last_ts is not None and last_ts > 0:
+            ts_int = int(last_ts)
+            return f"<t:{ts_int}:d> в <t:{ts_int}:t> (<t:{ts_int}:R>)"
+        if last_date_str:
+            try:
+                dt = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+                today_utc = datetime.now(timezone.utc).date()
+                diff = (today_utc - dt).days
+                date_ru = dt.strftime("%d.%m.%Y")
+                if diff <= 0:
+                    rel = "сегодня"
+                elif diff == 1:
+                    rel = "вчера"
+                else:
+                    if 11 <= (diff % 100) <= 14:
+                        suf = "дней"
+                    elif diff % 10 == 1:
+                        suf = "день"
+                    elif 2 <= (diff % 10) <= 4:
+                        suf = "дня"
+                    else:
+                        suf = "дней"
+                    rel = f"{diff} {suf} назад"
+                return f"**{date_ru}** ({rel})"
+            except Exception:
+                return last_date_str
+        return "нет данных"
+
     async def _build_utop_embed(self, guild: Optional[discord.Guild]) -> discord.Embed:
         guild_id = guild.id if guild else 0
         target_id = self.TARGET_UTOP_USER_ID
         target_member = guild.get_member(target_id) if guild else None
 
         # Мгновенная синхронизация текущего интервала перед формированием отчета
-        now = time.time()
-        elapsed = now - getattr(self, "_last_co_tick", now)
-        self._last_co_tick = now
-        if 0 < elapsed < 120 and guild:
-            co_updates: list[tuple[int, int, int, float]] = []
-            for vc in list(guild.voice_channels) + list(guild.stage_channels):
-                if is_afk_channel(vc):
-                    continue
-                m_ids = [m.id for m in vc.members if not m.bot]
-                if len(m_ids) >= 2:
-                    for i in range(len(m_ids)):
-                        for j in range(i + 1, len(m_ids)):
-                            co_updates.append((guild.id, m_ids[i], m_ids[j], elapsed))
-            if co_updates:
-                tracker.add_co_presence_batch(co_updates)
+        await self._flush_co_presence()
+        if guild and target_member and target_member.voice and target_member.voice.channel:
+            if not is_afk_channel(target_member.voice.channel):
+                active_ids = [m.id for m in target_member.voice.channel.members if not m.bot and m.id != target_id]
+                if active_ids:
+                    await asyncio.to_thread(tracker.touch_co_presence, guild.id, target_id, active_ids)
 
-        rows = tracker.get_top_companions(guild_id, target_id, limit=10, period="all")
+        rows = await asyncio.to_thread(tracker.get_top_companions, guild_id, target_id, 10, "all")
 
         target_mention = target_member.mention if target_member else f"<@{target_id}>"
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+        description = f"С кем чаще всего проводит время в голосовых каналах {target_mention}:"
+        if rows:
+            lines = []
+            for idx, (comp_id, secs, last_ts, last_date) in enumerate(rows):
+                medal = medals[idx] if idx < len(medals) else f"`{idx + 1}.`"
+                comp_member = guild.get_member(comp_id) if guild else None
+                comp_mention = comp_member.mention if comp_member else f"<@{comp_id}>"
+                duration_str = format_voice_duration(secs)
+                last_str = self._format_last_interaction(last_ts, last_date)
+                lines.append(
+                    f"{medal} {comp_mention} — **{duration_str}**\n"
+                    f"└ *Посл. взаимодействие:* {last_str}"
+                )
+            # Используем description (лимит 4096 символов вместо 1024 у field), чтобы даты не обрезались
+            description += "\n\n**🏆 Топ-10 собеседников в голосовых каналах**\n" + "\n".join(lines)
 
         embed = discord.Embed(
             title="👥 Топ совместного голосового времени",
-            description=f"С кем чаще всего проводит время в голосовых каналах {target_mention}:",
+            description=description,
             color=LogColors.PURPLE,
             timestamp=discord.utils.utcnow(),
         )
 
         if target_member and target_member.display_avatar:
             embed.set_thumbnail(url=target_member.display_avatar.url)
-
-        # Если участник прямо сейчас находится в голосовом канале
-        if target_member and target_member.voice and target_member.voice.channel:
-            vc_name = target_member.voice.channel.name
-            current_listeners = [
-                m.mention for m in target_member.voice.channel.members if not m.bot and m.id != target_id
-            ]
-            now_with = ", ".join(current_listeners) if current_listeners else "один(одна)"
-            embed.add_field(
-                name="🎙️ Прямо сейчас в голосовом канале",
-                value=f"Канал: **#{vc_name}**\nВместе с: {now_with}",
-                inline=False,
-            )
-
-        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
         if not rows:
             embed.add_field(
@@ -1236,18 +1315,17 @@ class UserProfileCog(commands.Cog):
                 ),
                 inline=False,
             )
-        else:
-            lines = []
-            for idx, (comp_id, secs) in enumerate(rows):
-                medal = medals[idx] if idx < len(medals) else f"`{idx + 1}.`"
-                comp_member = guild.get_member(comp_id) if guild else None
-                comp_mention = comp_member.mention if comp_member else f"<@{comp_id}>"
-                duration_str = format_voice_duration(secs)
-                lines.append(f"{medal} {comp_mention} — **{duration_str}**")
 
+        # Если участник прямо сейчас находится в голосовом канале
+        if target_member and target_member.voice and target_member.voice.channel:
+            vc_name = target_member.voice.channel.name
+            current_listeners = [
+                m.mention for m in target_member.voice.channel.members if not m.bot and m.id != target_id
+            ]
+            now_with = ", ".join(current_listeners) if current_listeners else "один(одна)"
             embed.add_field(
-                name="🏆 Топ-10 собеседников в голосовых каналах",
-                value="\n".join(lines),
+                name="🎙️ Прямо сейчас в голосовом канале",
+                value=f"Канал: **#{vc_name}**\nВместе с: {now_with}",
                 inline=False,
             )
 
